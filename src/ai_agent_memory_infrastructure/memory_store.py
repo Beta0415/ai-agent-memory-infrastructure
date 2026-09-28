@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
 from uuid import uuid4
 
 import chromadb
@@ -15,11 +14,11 @@ from openai import OpenAI
 
 
 class MemoryType(StrEnum):
-    CONVERSATION = "conversation"
     FACT = "fact"
     PREFERENCE = "preference"
     GOAL = "goal"
     INSTRUCTION = "instruction"
+    EPISODE = "episode"
 
 
 @dataclass(frozen=True)
@@ -49,46 +48,6 @@ class MemoryFilters:
     sources: tuple[str, ...] = ()
     session_ids: tuple[str, ...] = ()
     min_importance: float | None = None
-
-
-class MemoryAPI(Protocol):
-    def memory_add(
-        self,
-        content: str,
-        *,
-        memory_type: MemoryType,
-        role: str,
-        source: str,
-        session_id: str,
-        importance: float = 0.5,
-        metadata: Mapping[str, object] | None = None,
-    ) -> Memory: ...
-
-    def memory_search(
-        self,
-        query: str,
-        *,
-        limit: int = 5,
-        min_similarity: float | None = None,
-        filters: MemoryFilters | None = None,
-    ) -> list[MemoryMatch]: ...
-
-    def memory_get(self, memory_id: str) -> Memory | None: ...
-
-    def memory_update(
-        self,
-        memory_id: str,
-        *,
-        content: str | None = None,
-        memory_type: MemoryType | None = None,
-        role: str | None = None,
-        source: str | None = None,
-        session_id: str | None = None,
-        importance: float | None = None,
-        metadata: Mapping[str, object] | None = None,
-    ) -> Memory: ...
-
-    def memory_delete(self, memory_id: str) -> bool: ...
 
 
 class ChromaMemoryStore:
@@ -188,12 +147,16 @@ class ChromaMemoryStore:
         updated_at = cls._parse_timestamp(
             raw_metadata.get("updated_at"), created_at
         )
-        try:
-            memory_type = MemoryType(
-                str(raw_metadata.get("memory_type", "conversation"))
-            )
-        except ValueError:
-            memory_type = MemoryType.CONVERSATION
+        raw_memory_type = str(
+            raw_metadata.get("memory_type", "episode")
+        )
+        if raw_memory_type == "conversation":
+            memory_type = MemoryType.EPISODE
+        else:
+            try:
+                memory_type = MemoryType(raw_memory_type)
+            except ValueError:
+                memory_type = MemoryType.EPISODE
 
         stored_metadata: dict[str, object] = {}
         metadata_json = raw_metadata.get("metadata_json")
@@ -223,7 +186,7 @@ class ChromaMemoryStore:
             metadata=stored_metadata,
         )
 
-    def memory_add(
+    def write_memory(
         self,
         content: str,
         *,
@@ -284,10 +247,12 @@ class ChromaMemoryStore:
             elif values:
                 conditions.append({field: {"$in": list(values)}})
 
-        add_values(
-            "memory_type",
-            [memory_type.value for memory_type in filters.memory_types],
-        )
+        memory_type_values: list[str] = []
+        for memory_type in filters.memory_types:
+            memory_type_values.append(memory_type.value)
+            if memory_type is MemoryType.EPISODE:
+                memory_type_values.append("conversation")
+        add_values("memory_type", memory_type_values)
         add_values("role", filters.roles)
         add_values("source", filters.sources)
         add_values("session_id", filters.session_ids)

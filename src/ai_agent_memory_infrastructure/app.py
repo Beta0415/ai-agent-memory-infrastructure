@@ -7,7 +7,11 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from ai_agent_memory_infrastructure.memory_api import AgentMemory
 from ai_agent_memory_infrastructure.memory_runtime import MemoryRuntime
+from ai_agent_memory_infrastructure.memory_selector import (
+    OpenAIMemorySelector,
+)
 from ai_agent_memory_infrastructure.memory_store import ChromaMemoryStore
 
 load_dotenv()
@@ -22,17 +26,30 @@ def get_memory_store(path: str, embedding_model: str) -> ChromaMemoryStore:
     )
 
 
+@st.cache_resource
+def get_memory_selector(model: str) -> OpenAIMemorySelector:
+    return OpenAIMemorySelector(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
 api_key = os.getenv("OPENAI_API_KEY", "").strip()
 chroma_path = os.getenv("CHROMA_PATH", ".chroma")
 embedding_model = os.getenv(
     "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
 )
+memory_selector_model = os.getenv(
+    "MEMORY_SELECTOR_MODEL", "gpt-5.6-luna"
+)
 
 memory_store = None
+memory_selector = None
 memory_error = None
 if api_key:
     try:
         memory_store = get_memory_store(chroma_path, embedding_model)
+        memory_selector = get_memory_selector(memory_selector_model)
     except Exception as exc:
         memory_error = str(exc)
 
@@ -47,15 +64,17 @@ if "messages" not in st.session_state:
 if "memory_session_id" not in st.session_state:
     st.session_state.memory_session_id = uuid4().hex
 
-memory_runtime = (
-    MemoryRuntime(
+memory_api = (
+    AgentMemory(
         memory_store,
-        source="streamlit_chat",
+        memory_selector,
+        source="memory_selector_v1",
         session_id=st.session_state.memory_session_id,
     )
-    if memory_store
+    if memory_store and memory_selector
     else None
 )
+memory_runtime = MemoryRuntime(memory_api) if memory_api else None
 
 with st.sidebar:
     st.header("Setting")
@@ -74,10 +93,10 @@ with st.sidebar:
     st.caption(
         f"Current Session: `{st.session_state.memory_session_id[:8]}`"
     )
-    if memory_store:
-        st.metric("Saved Memories", memory_store.count())
+    if memory_api:
+        st.metric("Saved Memories", memory_api.count())
         if st.button("Clear Saved Memories", use_container_width=True):
-            memory_store.clear()
+            memory_api.clear()
             st.rerun()
     elif memory_error:
         st.warning(f"Memory Unavailable: {memory_error}")
@@ -166,11 +185,18 @@ if prompt:
                 )
                 if memory_runtime:
                     try:
-                        memory_runtime.runtime_save_exchange_to_memory(
-                            prompt, answer
+                        memory_runtime.runtime_write_memory(
+                            [
+                                {
+                                    "role": message["role"],
+                                    "content": message["content"],
+                                }
+                                for message in st.session_state.messages
+                            ]
                         )
                     except Exception as exc:
                         st.warning(
-                            "Response Generated, But Memory Was Not Saved: "
+                            "Response Generated, But Memory Selection "
+                            "Or Storage Failed: "
                             f"{exc}"
                         )

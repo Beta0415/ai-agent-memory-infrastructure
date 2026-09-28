@@ -3,12 +3,49 @@ from __future__ import annotations
 import tempfile
 import unittest
 
+from ai_agent_memory_infrastructure.memory_api import AgentMemory
 from ai_agent_memory_infrastructure.memory_runtime import MemoryRuntime
+from ai_agent_memory_infrastructure.memory_selector import (
+    MemoryCandidate,
+    MemorySelectionOutput,
+)
 from ai_agent_memory_infrastructure.memory_store import (
     ChromaMemoryStore,
     MemoryFilters,
     MemoryType,
 )
+
+
+class FakeMemorySelector:
+    model_name = "fake-memory-selector"
+
+    def extract_memory(self, conversation):
+        return MemorySelectionOutput(
+            candidates=[
+                MemoryCandidate(
+                    content="Preference: The user prefers concise answers.",
+                    type=MemoryType.PREFERENCE,
+                    importance=0.8,
+                    confidence=0.95,
+                    should_store=True,
+                    role="user",
+                    debug_source_quote="Please keep answers concise.",
+                    debug_reason="This is a durable response preference.",
+                ),
+                MemoryCandidate(
+                    content="Conversation: The assistant acknowledged.",
+                    type=MemoryType.EPISODE,
+                    importance=0.1,
+                    confidence=0.9,
+                    should_store=False,
+                    role="assistant",
+                    debug_source_quote="I will keep them concise.",
+                    debug_reason=(
+                        "This acknowledgement is not useful long-term."
+                    ),
+                ),
+            ]
+        )
 
 
 class MemoryAPITest(unittest.TestCase):
@@ -37,7 +74,7 @@ class MemoryAPITest(unittest.TestCase):
         return embeddings
 
     def test_core_memory_lifecycle(self) -> None:
-        memory = self.store.memory_add(
+        memory = self.store.write_memory(
             "The user prefers Python.",
             memory_type=MemoryType.PREFERENCE,
             role="user",
@@ -77,25 +114,69 @@ class MemoryAPITest(unittest.TestCase):
         self.assertTrue(self.store.memory_delete(memory.id))
         self.assertFalse(self.store.memory_delete(memory.id))
 
-    def test_runtime_helpers_save_and_retrieve_exchange(self) -> None:
-        runtime = MemoryRuntime(
-            self.store,
-            source="test_chat",
-            session_id="session-2",
-        )
-        user_memory, assistant_memory = (
-            runtime.runtime_save_exchange_to_memory(
-                "Please keep answers concise.",
-                "I will keep them concise.",
-            )
+    def test_legacy_conversation_memories_map_to_episodes(self) -> None:
+        self.store._collection.add(
+            ids=["legacy-memory"],
+            embeddings=self._fake_embed(["A past event occurred."]),
+            documents=["A past event occurred."],
+            metadatas=[
+                {
+                    "memory_type": "conversation",
+                    "role": "user",
+                    "source": "legacy",
+                    "session_id": "legacy-session",
+                    "importance": 0.5,
+                }
+            ],
         )
 
-        self.assertEqual(self.store.count(), 2)
-        self.assertEqual(user_memory.role, "user")
-        self.assertEqual(assistant_memory.role, "assistant")
+        loaded = self.store.memory_get("legacy-memory")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.memory_type, MemoryType.EPISODE)
+
+        matches = self.store.memory_search(
+            "A past event occurred.",
+            filters=MemoryFilters(memory_types=(MemoryType.EPISODE,)),
+        )
+        self.assertEqual(matches[0].memory.id, "legacy-memory")
+
+    def test_runtime_selects_and_saves_approved_candidates(self) -> None:
+        memory_api = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="memory_selector_v1",
+            session_id="session-2",
+        )
+        runtime = MemoryRuntime(memory_api)
+        result = runtime.runtime_write_memory(
+            [
+                {
+                    "role": "user",
+                    "content": "Please keep answers concise.",
+                },
+                {
+                    "role": "assistant",
+                    "content": "I will keep them concise.",
+                },
+            ]
+        )
+
+        self.assertEqual(len(result.selection.candidates), 2)
+        self.assertEqual(len(result.stored_memories), 1)
+        self.assertEqual(self.store.count(), 1)
+        stored_memory = result.stored_memories[0]
+        self.assertEqual(stored_memory.memory_type, MemoryType.PREFERENCE)
+        self.assertEqual(stored_memory.role, "user")
+        self.assertEqual(stored_memory.metadata["confidence"], 0.95)
         self.assertEqual(
-            user_memory.metadata["exchange_id"],
-            assistant_memory.metadata["exchange_id"],
+            stored_memory.metadata["debug_source_quote"],
+            "Please keep answers concise.",
+        )
+        self.assertNotIn("debug_reason", stored_memory.metadata)
+        self.assertEqual(
+            stored_memory.metadata["selector_model"],
+            "fake-memory-selector",
         )
 
         context = runtime.runtime_build_memory_context("concise")
