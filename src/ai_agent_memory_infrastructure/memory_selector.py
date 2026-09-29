@@ -17,7 +17,6 @@ class MemoryCandidate(BaseModel):
     type: MemoryType
     importance: float = Field(ge=0.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
-    should_store: bool
     role: Literal["user", "assistant", "conversation"]
     debug_source_quote: str = Field(min_length=1, max_length=2000)
     debug_reason: str = Field(min_length=1, max_length=500)
@@ -26,7 +25,21 @@ class MemoryCandidate(BaseModel):
 class MemorySelectionOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[MemoryCandidate]
+    selected: list[MemoryCandidate] = Field(
+        description=(
+            "Durable statements from the latest exchange that should be "
+            "stored."
+        )
+    )
+    not_selected: list[MemoryCandidate] = Field(
+        description=(
+            "Every other semantically meaningful statement in the latest "
+            "user and assistant messages. This includes greetings, small "
+            "talk, one-off questions, temporary details, and generic "
+            "replies. Do not omit them. Leave this empty only when the "
+            "latest exchange contains no non-durable content."
+        )
+    )
 
 
 class MemorySelector(Protocol):
@@ -46,6 +59,16 @@ Read the conversation and break the latest user/assistant exchange into
 atomic candidate memory statements. Use earlier turns only to resolve
 references and context. Do not repeatedly extract old information.
 
+Audit the complete latest exchange. Put every semantically meaningful atomic
+statement into exactly one list:
+- selected: durable information that should be stored
+- not_selected: everything else, including greetings, small talk, temporary
+  details, questions, generic acknowledgements, and other rejected content
+
+Never silently omit a meaningful statement. A statement that is absent from
+selected must appear in not_selected, with the rejection explained in
+debug_reason.
+
 Each candidate must:
 - Be a standalone, concise statement that makes sense outside the chat.
 - Use one of these memory types:
@@ -57,20 +80,56 @@ Each candidate must:
 - Preserve important qualifiers and avoid unsupported assumptions.
 - Include an exact supporting quote in debug_source_quote.
 - Include a brief storage rationale in debug_reason.
+- For a secret or credential, redact the value in both content and
+  debug_source_quote rather than reproducing it.
 
-Set should_store=true only for durable, future-useful information such as:
-- User facts
-- Preferences
+Importance measures future utility and consequence, not certainty. Use:
+- 0.0-0.2: trivial or transient
+- 0.3-0.4: limited future usefulness
+- 0.5-0.6: useful recurring context
+- 0.7-0.8: stable preference, goal, project, decision, or constraint
+- 0.9-1.0: identity-critical fact, safety requirement, or persistent instruction
+
+Confidence separately measures how strongly the conversation supports the
+candidate.
+
+Put these in selected when they are durable and future-useful:
+- Long-term preferences
+- Projects
 - Goals
+- Decisions
+- Constraints
+- Important facts
+- Repeated interests
+- Long-running tasks
+- Relationships between important entities
 - Persistent instructions
-- Confirmed decisions or corrections
+- Confirmed corrections
 
-Set should_store=false for transient requests, greetings, filler, generic
-assistant responses, speculation, unconfirmed claims, or low-value details.
-Never store passwords, API keys, access tokens, credentials, or other secrets.
+Put these in not_selected:
+- Greetings
+- Small talk
+- Temporary statements
+- One-off questions
+- Information whose only relevance is already obvious from the current
+  conversation and has no future value
+- Random transient details
+- Filler or generic assistant responses
+- Speculation or unconfirmed claims
+- Passwords, API keys, access tokens, credentials, or other secrets
 
-Return an empty candidates list when the latest exchange contains no useful
-candidate memories.
+Return empty selected and not_selected lists only when the latest exchange is
+empty or has no semantically meaningful content. If the exchange mixes durable
+and non-durable content, selected and not_selected must both be non-empty.
+
+Example:
+User: "My name is Beta. The weather is nice today."
+Assistant: "Nice to meet you, Beta."
+selected:
+- "The user's name is Beta."
+not_selected:
+- "The user said the weather was nice."
+- "The assistant greeted Beta."
 """.strip()
 
 

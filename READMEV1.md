@@ -18,28 +18,78 @@ The project uses Python 3.13 and is managed with
 
 1. Copy `.env.example` to `.env`.
 2. Add an OpenAI API key:
-
-   ```dotenv
+  ```dotenv
    OPENAI_API_KEY=your-api-key-here
    OPENAI_MODEL=gpt-4o-mini
    MEMORY_SELECTOR_MODEL=gpt-5.6-luna
    OPENAI_EMBEDDING_MODEL=text-embedding-3-small
    CHROMA_PATH=.chroma
-   ```
-
+  ```
 3. Install the locked dependencies:
-
-   ```bash
+  ```bash
    uv sync
-   ```
-
+  ```
 4. Start the interface:
-
-   ```bash
+  ```bash
    uv run streamlit run src/ai_agent_memory_infrastructure/app.py
-   ```
+  ```
 
 The interface is available at `http://localhost:8501`.
+
+## Two Memory Paths
+
+The architecture is divided into a Write Path and a Read Path:
+
+```text
+User message
+  → Read Path
+  → Main LLM response
+  → Write Path
+```
+
+
+
+### Write Path
+
+Information goes into memory. It answers:
+
+> What from the current interaction should be remembered, and how should it
+> be stored?
+
+The current V1 Write Path contains:
+
+1. A runtime trigger after a successful main-model response.
+2. The public `memory_add(conversation)` operation.
+3. GPT-5.6 Luna structured memory extraction.
+4. Atomic candidate content generation.
+5. Memory-type classification.
+6. Importance and confidence scoring.
+7. A selected or not-selected decision.
+8. Filtering out the not-selected list.
+9. Runtime-generated IDs, timestamps, session data, and metadata.
+10. Content embedding with `text-embedding-3-small`.
+11. Persistent storage in ChromaDB.
+
+
+
+### Read Path
+
+Information comes out of memory and is prepared for the main LLM. It answers:
+
+> Given what the user is asking now, which existing memories should the model
+> know about, and how should they be presented?
+
+The current preliminary Read Path contains:
+
+1. The current user message as the retrieval query.
+2. Query embedding with `text-embedding-3-small`.
+3. Chroma cosine-similarity search across all sessions.
+4. Top-4 memory retrieval.
+5. Reconstruction of complete memory records and similarity scores.
+6. Formatting into compact memory-context lines.
+7. Injection through the OpenAI Responses API `instructions` parameter.
+
+V1 changes the Write Path. The Read Path remains unchanged from V0.
 
 ## V1 Write Path
 
@@ -50,8 +100,8 @@ decides what becomes memory:
 runtime_write_memory()
   → AgentMemory.memory_add()
       → OpenAIMemorySelector.extract_memory()
-      → Structured candidate memories
-      → should_store filtering
+      → Structured selected and not-selected lists
+      → Keep selected, discard not-selected
       → ChromaMemoryStore.write_memory()
           → Validation
           → Embedding
@@ -74,23 +124,80 @@ The selector returns structured output:
 
 ```json
 {
-  "candidates": [
+  "selected": [
     {
       "content": "The user prefers concise answers.",
       "type": "preference",
       "importance": 0.8,
       "confidence": 0.99,
-      "should_store": true,
       "role": "user",
       "debug_source_quote": "I prefer concise answers.",
       "debug_reason": "This is a durable communication preference."
+    }
+  ],
+  "not_selected": [
+    {
+      "content": "The assistant acknowledged the preference.",
+      "type": "episode",
+      "importance": 0.1,
+      "confidence": 0.9,
+      "role": "assistant",
+      "debug_source_quote": "Understood.",
+      "debug_reason": "A generic acknowledgement has no future value."
     }
   ]
 }
 ```
 
-Only candidates with `should_store: true` are embedded and persisted.
-Rejected candidates and `debug_reason` remain transient.
+Only `selected` candidates are embedded and persisted. `not_selected`
+candidates and `debug_reason` remain transient and are shown in Memory Debug.
+
+The selector audits the complete latest user/assistant turn. Every meaningful
+statement goes into exactly one list. Non-durable content must appear in
+`not_selected` rather than being omitted. Both lists are empty only when the
+latest turn contains no meaningful content. Secret values are redacted from
+rejected debug candidates.
+
+### Selector Storage Policy
+
+Importance measures future utility and consequence, not certainty:
+
+- `0.0–0.2`: trivial or transient
+- `0.3–0.4`: limited future usefulness
+- `0.5–0.6`: useful recurring context
+- `0.7–0.8`: stable preference, goal, project, decision, or constraint
+- `0.9–1.0`: identity-critical fact, safety requirement, or persistent
+  instruction
+
+Confidence is separate: it measures how strongly the conversation supports
+the candidate.
+
+Typical information to store:
+
+- Long-term preferences
+- Projects
+- Goals
+- Decisions
+- Constraints
+- Important facts
+- Repeated interests
+- Long-running tasks
+- Relationships between important entities
+- Persistent instructions
+- Confirmed corrections
+
+Typical information not to store:
+
+- Greetings
+- Small talk
+- Temporary statements
+- One-off questions
+- Information whose only relevance is already obvious from the current
+  conversation and has no future value
+- Random transient details
+- Filler or generic assistant responses
+- Speculation or unconfirmed claims
+- Passwords, API keys, access tokens, credentials, or other secrets
 
 ## Memory Types
 
@@ -130,8 +237,7 @@ remaining fields to the stored record:
 
 IDs, timestamps, source, session ID, and exchange ID are generated by Python.
 `debug_source_quote` and selector confidence are LLM-generated diagnostic
-metadata. `should_store` is not persisted because every stored record has
-already passed that decision.
+metadata. Rejected candidates are not persisted.
 
 ## Memory API
 
@@ -156,7 +262,7 @@ Internal write functions:
 The main chat model cannot call these functions. The Python runtime invokes
 them automatically.
 
-## Retrieval Path
+## Read Path
 
 Retrieval is unchanged from V0:
 
@@ -165,7 +271,7 @@ Retrieval is unchanged from V0:
 3. Return up to four complete memory records.
 4. Format the matches as memory context.
 5. Pass the formatted context through the OpenAI Responses API
-   `instructions` parameter.
+  `instructions` parameter.
 
 The main model receives lines such as:
 
@@ -184,8 +290,11 @@ summarization, or token-budget management.
 - `New Session` clears the transcript and generates a new session ID.
 - Chroma memory is shared across sessions.
 - `Clear Saved Memories` deletes all persisted Chroma memories.
-- `Show Memory Debug` displays the exact retrieved memory context supplied to
-  the main model.
+- `Show Memory Debug` opens a panel beside the conversation. Each turn has
+  three tabs: retrieved memories from the Read Path, candidates selected for
+  storage by the Write Path, and candidates the selector rejected. Only the
+  chosen tab is shown. The exact context supplied to the main model is under
+  Retrieved.
 
 The runtime searches across all sessions. Session IDs are stored as metadata
 but are not currently used as retrieval filters.

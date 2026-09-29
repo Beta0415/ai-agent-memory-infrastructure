@@ -21,30 +21,30 @@ class FakeMemorySelector:
 
     def extract_memory(self, conversation):
         return MemorySelectionOutput(
-            candidates=[
+            selected=[
                 MemoryCandidate(
                     content="Preference: The user prefers concise answers.",
                     type=MemoryType.PREFERENCE,
                     importance=0.8,
                     confidence=0.95,
-                    should_store=True,
                     role="user",
                     debug_source_quote="Please keep answers concise.",
                     debug_reason="This is a durable response preference.",
-                ),
+                )
+            ],
+            not_selected=[
                 MemoryCandidate(
                     content="Conversation: The assistant acknowledged.",
                     type=MemoryType.EPISODE,
                     importance=0.1,
                     confidence=0.9,
-                    should_store=False,
                     role="assistant",
                     debug_source_quote="I will keep them concise.",
                     debug_reason=(
                         "This acknowledgement is not useful long-term."
                     ),
-                ),
-            ]
+                )
+            ],
         )
 
 
@@ -162,7 +162,8 @@ class MemoryAPITest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(len(result.selection.candidates), 2)
+        self.assertEqual(len(result.selection.selected), 1)
+        self.assertEqual(len(result.selection.not_selected), 1)
         self.assertEqual(len(result.stored_memories), 1)
         self.assertEqual(self.store.count(), 1)
         stored_memory = result.stored_memories[0]

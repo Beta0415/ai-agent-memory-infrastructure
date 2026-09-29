@@ -79,9 +79,7 @@ class AgentMemory:
         exchange_id = uuid4().hex
         stored_memories: list[Memory] = []
 
-        for candidate in selection.candidates:
-            if not candidate.should_store:
-                continue
+        for candidate in selection.selected:
             stored_memories.append(
                 self._store.write_memory(
                     candidate.content,
