@@ -3,19 +3,21 @@ from __future__ import annotations
 import os
 from uuid import uuid4
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
 from ai_agent_memory_infrastructure.memory_api import AgentMemory
+from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
 from ai_agent_memory_infrastructure.memory_runtime import MemoryRuntime
+from ai_agent_memory_infrastructure.memory_reranker import (
+    OpenAIMemoryReranker,
+)
 from ai_agent_memory_infrastructure.memory_selector import (
     OpenAIMemorySelector,
 )
-from ai_agent_memory_infrastructure.memory_store import (
-    ChromaMemoryStore,
-    MemoryMatch,
-)
+from ai_agent_memory_infrastructure.memory_store import ChromaMemoryStore
 
 load_dotenv()
 
@@ -43,7 +45,15 @@ def get_memory_selector(model: str) -> OpenAIMemorySelector:
     )
 
 
-def serialize_memory_match(match: MemoryMatch) -> dict[str, object]:
+@st.cache_resource
+def get_memory_reranker(model: str) -> OpenAIMemoryReranker:
+    return OpenAIMemoryReranker(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+def serialize_memory_match(match: RetrievedMemory) -> dict[str, object]:
     memory = match.memory
     return {
         "id": memory.id,
@@ -53,7 +63,11 @@ def serialize_memory_match(match: MemoryMatch) -> dict[str, object]:
         "source": memory.source,
         "session_id": memory.session_id,
         "importance": memory.importance,
-        "similarity_score": match.similarity_score,
+        "semantic_score": match.semantic_score,
+        "recency_score": match.recency_score,
+        "retrieval_score": match.retrieval_score,
+        "final_score": match.final_score,
+        "rerank_score": match.rerank_score,
         "created_at": memory.created_at.isoformat(),
         "updated_at": memory.updated_at.isoformat(),
         "metadata": memory.metadata,
@@ -83,7 +97,11 @@ def render_debug_cards(
         role = str(record.get("role", "unknown"))
         if kind == "retrieved":
             extra = (
-                f"Similarity {float(record.get('similarity_score', 0.0)):.3f}"
+                f"Final {float(record.get('final_score', 0.0)):.3f} · "
+                f"Retrieval {float(record.get('retrieval_score', 0.0)):.3f} · "
+                f"Semantic {float(record.get('semantic_score', 0.0)):.3f} · "
+                f"Recency {float(record.get('recency_score', 0.0)):.3f} · "
+                f"Importance {float(record.get('importance', 0.0)):.2f}"
             )
         else:
             extra = (
@@ -189,6 +207,91 @@ def render_memory_debug_panel(
                 st.error(f"Write Path Error: {write_error}")
 
 
+def _score_text(value: object) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):.3f}"
+
+
+def render_retrieval_inspector(
+    messages: list[dict[str, object]],
+) -> None:
+    st.subheader("Retrieval Inspector")
+    turns: list[tuple[int, str, dict[str, object]]] = []
+    latest_user_message = ""
+    turn_number = 0
+
+    for message in messages:
+        if message["role"] == "user":
+            latest_user_message = str(message["content"])
+        elif message["role"] == "assistant":
+            turn_number += 1
+            turns.append((turn_number, latest_user_message, message))
+
+    if not turns:
+        st.info("No Completed Turns To Inspect")
+        return
+
+    for index, (turn_number, user_message, assistant_message) in enumerate(
+        reversed(turns)
+    ):
+        heading = f"Turn {turn_number}"
+        if index == 0:
+            heading += " · Latest"
+        with st.expander(heading, expanded=index == 0):
+            st.caption(_preview(user_message))
+            candidates = assistant_message.get("retrieval_candidates", [])
+            if not isinstance(candidates, list) or not candidates:
+                st.caption("No Retrieval Candidates")
+                continue
+            ordered = sorted(
+                candidates,
+                key=lambda record: float(record.get("retrieval_score", 0.0)),
+                reverse=True,
+            )
+            rows = [
+                {
+                    "Memory": str(record.get("content", "")).strip(),
+                    "Combined": _score_text(record.get("retrieval_score")),
+                    "Semantic": _score_text(record.get("semantic_score")),
+                    "Recency": _score_text(record.get("recency_score")),
+                    "Importance": _score_text(record.get("importance")),
+                    "Rerank": _score_text(record.get("rerank_score")),
+                }
+                for record in ordered
+            ]
+            table = pd.DataFrame(
+                rows,
+                columns=[
+                    "Memory",
+                    "Combined",
+                    "Semantic",
+                    "Recency",
+                    "Importance",
+                    "Rerank",
+                ],
+            )
+            highlighted = table.style.map(
+                lambda _: (
+                    "background-color: #f5c16c; "
+                    "color: #1a1a1a; "
+                    "font-weight: 650;"
+                ),
+                subset=["Rerank"],
+            )
+            st.dataframe(
+                highlighted,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Memory": st.column_config.TextColumn(width="large"),
+                },
+            )
+            read_error = assistant_message.get("memory_read_error")
+            if read_error:
+                st.error(f"Read Path Error: {read_error}")
+
+
 def generate_assistant_turn(
     prompt: str,
     *,
@@ -198,6 +301,7 @@ def generate_assistant_turn(
 ) -> dict[str, object] | None:
     memory_context = ""
     retrieved_memories: list[dict[str, object]] = []
+    retrieval_candidates: list[dict[str, object]] = []
     memory_read_error = None
     try:
         if memory_runtime:
@@ -209,6 +313,10 @@ def generate_assistant_turn(
                 retrieved_memories = [
                     serialize_memory_match(match)
                     for match in read_result.matches
+                ]
+                retrieval_candidates = [
+                    serialize_memory_match(candidate)
+                    for candidate in read_result.candidates
                 ]
             except Exception as exc:
                 memory_read_error = str(exc)
@@ -244,6 +352,7 @@ def generate_assistant_turn(
         "content": answer,
         "memory_context": memory_context,
         "retrieved_memories": retrieved_memories,
+        "retrieval_candidates": retrieval_candidates,
         "memory_read_error": memory_read_error,
     }
     memory_write_debug: dict[str, object] = {
@@ -302,14 +411,19 @@ embedding_model = os.getenv(
 memory_selector_model = os.getenv(
     "MEMORY_SELECTOR_MODEL", "gpt-5.6-luna"
 )
+memory_reranker_model = os.getenv(
+    "MEMORY_RERANKER_MODEL", "gpt-5-nano"
+)
 
 memory_store = None
 memory_selector = None
+memory_reranker = None
 memory_error = None
 if api_key:
     try:
         memory_store = get_memory_store(chroma_path, embedding_model)
         memory_selector = get_memory_selector(memory_selector_model)
+        memory_reranker = get_memory_reranker(memory_reranker_model)
     except Exception as exc:
         memory_error = str(exc)
 
@@ -327,8 +441,9 @@ memory_api = (
         memory_selector,
         source="memory_selector_v1",
         session_id=st.session_state.memory_session_id,
+        reranker=memory_reranker,
     )
-    if memory_store and memory_selector
+    if memory_store and memory_selector and memory_reranker
     else None
 )
 memory_runtime = MemoryRuntime(memory_api) if memory_api else None
@@ -339,7 +454,11 @@ with st.sidebar:
         "OpenAI Model",
         value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     ).strip()
-    show_memory_debug = st.checkbox("Show Memory Debug")
+    side_panel = st.radio(
+        "Side Panel",
+        ["Off", "Show Memory Debug", "Show Retrieval Inspector"],
+        label_visibility="collapsed",
+    )
     if st.button("Clear Conversation", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -365,20 +484,22 @@ if not api_key:
         "Then Restart This App."
     )
 
-if show_memory_debug:
-    chat_column, debug_column = st.columns([1, 1], gap="large")
+if side_panel == "Off":
+    chat_column, side_column = st.container(), None
 else:
-    chat_column = st.container()
-    debug_column = None
+    chat_column, side_column = st.columns([1, 1], gap="large")
 
 with chat_column:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-if debug_column:
-    with debug_column:
-        render_memory_debug_panel(st.session_state.messages)
+if side_column:
+    with side_column:
+        if side_panel == "Show Memory Debug":
+            render_memory_debug_panel(st.session_state.messages)
+        elif side_panel == "Show Retrieval Inspector":
+            render_retrieval_inspector(st.session_state.messages)
 
 prompt = st.chat_input("Send A Message", disabled=not api_key)
 if prompt:

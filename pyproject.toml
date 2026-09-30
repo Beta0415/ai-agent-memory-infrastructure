@@ -2,7 +2,7 @@
 name = "ai-agent-memory-infrastructure"
 version = "0.1.0"
 description = "Add your description here"
-readme = "READMEV1.md"
+readme = "READMEV2.md"
 authors = [
     { name = "Beta Chen", email = "zc2877@nyu.edu" }
 ]
