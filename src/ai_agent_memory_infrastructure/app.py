@@ -8,7 +8,10 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from ai_agent_memory_infrastructure.memory_api import AgentMemory
+from ai_agent_memory_infrastructure.memory_api import (
+    AgentMemory,
+    ReadPathSettings,
+)
 from ai_agent_memory_infrastructure.memory_context import (
     DuplicateCluster,
     count_tokens,
@@ -464,12 +467,22 @@ def _render_score_table(assistant_message: dict[str, object]) -> None:
     )
 
 
+def current_read_path_settings() -> ReadPathSettings:
+    settings = st.session_state.get("read_path_settings")
+    if isinstance(settings, ReadPathSettings):
+        return settings
+    settings = ReadPathSettings()
+    st.session_state.read_path_settings = settings
+    return settings
+
+
 def generate_assistant_turn(
     prompt: str,
     *,
     api_key: str,
     model: str,
     memory_runtime: MemoryRuntime | None,
+    settings: ReadPathSettings | None = None,
 ) -> dict[str, object] | None:
     memory_context = ""
     retrieved_memories: list[dict[str, object]] = []
@@ -482,7 +495,8 @@ def generate_assistant_turn(
         if memory_runtime:
             try:
                 read_result = memory_runtime.runtime_build_memory_context(
-                    prompt
+                    prompt,
+                    settings=settings,
                 )
                 memory_context = read_result.text
                 deduplicated = read_result.deduplicated
@@ -636,6 +650,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "memory_session_id" not in st.session_state:
     st.session_state.memory_session_id = uuid4().hex
+if "read_path_settings" not in st.session_state:
+    st.session_state.read_path_settings = ReadPathSettings()
 
 memory_api = (
     AgentMemory(
@@ -664,6 +680,8 @@ with st.sidebar:
         "OpenAI Model",
         value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     ).strip()
+    if st.button("Parameter Configuration", use_container_width=True):
+        st.switch_page("pages/parameter_configuration.py")
     side_panel = st.radio(
         "Side Panel",
         ["Off", "Show Memory Debug", "Show Retrieval Inspector"],
@@ -720,6 +738,7 @@ if prompt:
             api_key=api_key,
             model=model,
             memory_runtime=memory_runtime,
+            settings=current_read_path_settings(),
         )
     if assistant_message:
         st.session_state.messages.append(assistant_message)

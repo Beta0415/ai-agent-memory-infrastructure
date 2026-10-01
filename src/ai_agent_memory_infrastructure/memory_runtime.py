@@ -7,6 +7,7 @@ from datetime import datetime
 from ai_agent_memory_infrastructure.memory_api import (
     MemoryAddResult,
     MemoryAPI,
+    ReadPathSettings,
 )
 from ai_agent_memory_infrastructure.memory_context import (
     DuplicateCluster,
@@ -41,6 +42,7 @@ class MemoryRuntime:
         min_similarity: float | None = None,
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
+        settings: ReadPathSettings | None = None,
     ) -> MemoryContext:
         result = self._memory_api.memory_context(
             query,
@@ -48,6 +50,7 @@ class MemoryRuntime:
             min_similarity=min_similarity,
             filters=filters,
             now=now,
+            settings=settings,
         )
         matches = result.memories
         text = format_context_memories(matches)

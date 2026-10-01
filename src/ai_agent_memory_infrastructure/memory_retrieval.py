@@ -66,17 +66,22 @@ def score_retrieved_memory(
     match: MemoryMatch,
     *,
     now: datetime,
+    semantic_weight: float = SEMANTIC_WEIGHT,
+    recency_weight: float = RECENCY_WEIGHT,
+    importance_weight: float = IMPORTANCE_WEIGHT,
+    lambda_per_day: float = RECENCY_LAMBDA_PER_DAY,
 ) -> RetrievedMemory:
     semantic_score = _unit_score(match.similarity_score)
     recency_score = calculate_recency_score(
         match.memory.created_at,
         now=now,
+        lambda_per_day=lambda_per_day,
     )
     importance = _unit_score(match.memory.importance)
     retrieval_score = (
-        SEMANTIC_WEIGHT * semantic_score
-        + RECENCY_WEIGHT * recency_score
-        + IMPORTANCE_WEIGHT * importance
+        semantic_weight * semantic_score
+        + recency_weight * recency_score
+        + importance_weight * importance
     )
     return RetrievedMemory(
         memory=match.memory,
@@ -92,9 +97,21 @@ def rank_by_retrieval_score(
     *,
     limit: int,
     now: datetime,
+    semantic_weight: float = SEMANTIC_WEIGHT,
+    recency_weight: float = RECENCY_WEIGHT,
+    importance_weight: float = IMPORTANCE_WEIGHT,
+    lambda_per_day: float = RECENCY_LAMBDA_PER_DAY,
 ) -> tuple[RetrievedMemory, ...]:
     scored = [
-        score_retrieved_memory(match, now=now) for match in matches
+        score_retrieved_memory(
+            match,
+            now=now,
+            semantic_weight=semantic_weight,
+            recency_weight=recency_weight,
+            importance_weight=importance_weight,
+            lambda_per_day=lambda_per_day,
+        )
+        for match in matches
     ]
     scored.sort(
         key=lambda item: (

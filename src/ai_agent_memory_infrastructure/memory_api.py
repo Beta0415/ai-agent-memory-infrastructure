@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from ai_agent_memory_infrastructure.memory_compressor import (
     MemoryCompressor,
 )
 from ai_agent_memory_infrastructure.memory_context import (
+    CONTEXT_DUPLICATE_SIMILARITY,
     CONTEXT_TOKEN_BUDGET,
     DuplicateCluster,
     apply_context_compression,
@@ -24,6 +26,10 @@ from ai_agent_memory_infrastructure.memory_relation import (
 from ai_agent_memory_infrastructure.memory_retrieval import (
     CANDIDATE_RETRIEVAL_LIMIT,
     DEFAULT_RESULT_LIMIT,
+    IMPORTANCE_WEIGHT,
+    RECENCY_HALF_LIFE_DAYS,
+    RECENCY_WEIGHT,
+    SEMANTIC_WEIGHT,
     WEIGHTED_CANDIDATE_LIMIT,
     MemoryReranker,
     RetrievedMemory,
@@ -40,6 +46,51 @@ from ai_agent_memory_infrastructure.memory_store import (
     MemoryFilters,
     MemoryType,
 )
+
+
+@dataclass(frozen=True)
+class ReadPathSettings:
+    semantic_weight: float = SEMANTIC_WEIGHT
+    recency_weight: float = RECENCY_WEIGHT
+    importance_weight: float = IMPORTANCE_WEIGHT
+    recency_half_life_days: float = RECENCY_HALF_LIFE_DAYS
+    candidate_limit: int = CANDIDATE_RETRIEVAL_LIMIT
+    weighted_limit: int = WEIGHTED_CANDIDATE_LIMIT
+    result_limit: int = DEFAULT_RESULT_LIMIT
+    duplicate_similarity: float = CONTEXT_DUPLICATE_SIMILARITY
+    token_budget: int = CONTEXT_TOKEN_BUDGET
+
+    def __post_init__(self) -> None:
+        weights = (
+            self.semantic_weight,
+            self.recency_weight,
+            self.importance_weight,
+        )
+        if any(weight < 0 for weight in weights):
+            raise ValueError("Retrieval weights must be zero or greater.")
+        if not math.isclose(sum(weights), 1.0, abs_tol=1e-6):
+            raise ValueError("Retrieval weights must sum to 1.")
+        if self.recency_half_life_days <= 0:
+            raise ValueError("Recency half-life must be greater than zero.")
+        if self.result_limit < 1:
+            raise ValueError("Returned memory count must be at least 1.")
+        if not (
+            self.candidate_limit >= self.weighted_limit >= self.result_limit
+        ):
+            raise ValueError(
+                "Retrieval cuts must stay in order: semantic candidates, "
+                "then the weighted pool, then the number returned."
+            )
+        if not 0.0 <= self.duplicate_similarity <= 1.0:
+            raise ValueError(
+                "Duplicate similarity must be between 0 and 1."
+            )
+        if self.token_budget < 1:
+            raise ValueError("Token budget must be at least 1.")
+
+    @property
+    def recency_lambda_per_day(self) -> float:
+        return math.log(2) / self.recency_half_life_days
 
 
 @dataclass(frozen=True)
@@ -78,6 +129,7 @@ class MemoryAPI(Protocol):
         min_similarity: float | None = None,
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
+        settings: ReadPathSettings | None = None,
     ) -> MemorySearchResult: ...
 
     def memory_context(
@@ -89,6 +141,7 @@ class MemoryAPI(Protocol):
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
         token_budget: int = CONTEXT_TOKEN_BUDGET,
+        settings: ReadPathSettings | None = None,
     ) -> MemoryContextResult: ...
 
     def memory_get(self, memory_id: str) -> Memory | None: ...
@@ -170,12 +223,16 @@ class AgentMemory:
         min_similarity: float | None = None,
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
+        settings: ReadPathSettings | None = None,
     ) -> MemorySearchResult:
-        if limit < 1:
-            raise ValueError("Memory result limit must be at least 1.")
+        active = (
+            settings
+            if settings is not None
+            else ReadPathSettings(result_limit=limit)
+        )
         semantic_matches = self._store.memory_search(
             query,
-            limit=max(limit, CANDIDATE_RETRIEVAL_LIMIT),
+            limit=active.candidate_limit,
             min_similarity=min_similarity,
             filters=filters,
         )
@@ -184,11 +241,15 @@ class AgentMemory:
             semantic_matches,
             limit=max(len(semantic_matches), 1),
             now=scored_at,
+            semantic_weight=active.semantic_weight,
+            recency_weight=active.recency_weight,
+            importance_weight=active.importance_weight,
+            lambda_per_day=active.recency_lambda_per_day,
         )
-        rerank_pool = scored_candidates[:WEIGHTED_CANDIDATE_LIMIT]
+        rerank_pool = scored_candidates[: active.weighted_limit]
         if self._reranker is None or not rerank_pool:
             return MemorySearchResult(
-                matches=tuple(scored_candidates[:limit]),
+                matches=tuple(scored_candidates[: active.result_limit]),
                 candidates=scored_candidates,
             )
         scores = self._reranker.rerank(query, rerank_pool)
@@ -201,7 +262,7 @@ class AgentMemory:
             for item in scored_candidates
         )
         return MemorySearchResult(
-            matches=tuple(reranked[:limit]),
+            matches=tuple(reranked[: active.result_limit]),
             candidates=candidates,
         )
 
@@ -214,15 +275,22 @@ class AgentMemory:
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
         token_budget: int = CONTEXT_TOKEN_BUDGET,
+        settings: ReadPathSettings | None = None,
     ) -> MemoryContextResult:
-        if token_budget < 1:
-            raise ValueError("Memory token budget must be at least 1.")
+        active = (
+            settings
+            if settings is not None
+            else ReadPathSettings(
+                result_limit=limit,
+                token_budget=token_budget,
+            )
+        )
         search = self.memory_search(
             query,
-            limit=limit,
             min_similarity=min_similarity,
             filters=filters,
             now=now,
+            settings=active,
         )
         if not search.matches:
             return MemoryContextResult(
@@ -236,6 +304,7 @@ class AgentMemory:
         groups = cluster_duplicate_memories(
             search.matches,
             embeddings,
+            duplicate_similarity=active.duplicate_similarity,
         )
         kept: list[RetrievedMemory] = []
         duplicate_clusters: list[DuplicateCluster] = []
@@ -266,7 +335,7 @@ class AgentMemory:
             if item.memory.id not in kept_ids
         )
         deduplicated = len(dropped_memories) > 0
-        if context_token_count(memories) > token_budget:
+        if context_token_count(memories) > active.token_budget:
             if self._compressor is None:
                 raise RuntimeError(
                     "Memory context exceeds the token budget and no "
@@ -274,7 +343,7 @@ class AgentMemory:
                 )
             compressed = self._compressor.compress(
                 memories,
-                token_budget=token_budget,
+                token_budget=active.token_budget,
             )
             memories = apply_context_compression(memories, compressed)
         memories = order_context_memories(memories)

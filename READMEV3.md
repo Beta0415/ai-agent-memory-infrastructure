@@ -18,12 +18,13 @@ The project uses Python 3.13 and is managed with
 - Embedding model: `text-embedding-3-small`
 - Vector store: local ChromaDB
 
+
+
 ## Setup
 
 1. Copy `.env.example` to `.env`.
 2. Add an OpenAI API key:
-
-   ```dotenv
+  ```dotenv
    OPENAI_API_KEY=your-api-key-here
    OPENAI_MODEL=gpt-4o-mini
    MEMORY_SELECTOR_MODEL=gpt-5.6-luna
@@ -32,19 +33,15 @@ The project uses Python 3.13 and is managed with
    MEMORY_RELATION_MODEL=gpt-5-mini
    OPENAI_EMBEDDING_MODEL=text-embedding-3-small
    CHROMA_PATH=.chroma
-   ```
-
+  ```
 3. Install the locked dependencies:
-
-   ```bash
+  ```bash
    uv sync
-   ```
-
+  ```
 4. Start the interface:
-
-   ```bash
+  ```bash
    uv run streamlit run src/ai_agent_memory_infrastructure/app.py
-   ```
+  ```
 
 The interface is available at `http://localhost:8501`.
 
@@ -63,10 +60,14 @@ is not given them as tools yet. The Python runtime calls them automatically.
 - `memory_update(memory_id, ...)`: changes one stored memory
 - `memory_delete(memory_id)`: deletes one stored memory
 
+
+
 ### Runtime Functions
 
 - `runtime_build_memory_context()`: calls `memory_context()` and formats the result for the main model
 - `runtime_write_memory()`: calls `memory_add()` after a successful main-model response
+
+
 
 ### Internal Functions
 
@@ -91,10 +92,14 @@ Context engine, inside `memory_context()`, after `memory_search()`:
 - `order_context_memories()` groups the result by memory type, then by relevance.
 - `format_context_memories()` renders the ordered memories for the main model.
 
+
+
 ### Administrative Functions
 
 - `count()`: returns the number of stored memories
 - `clear()`: deletes all stored memories
+
+
 
 ## Two Memory Paths
 
@@ -106,6 +111,8 @@ User message
   → Main LLM response
   → Write Path
 ```
+
+
 
 ### Write Path
 
@@ -127,6 +134,8 @@ The current Write Path contains:
 9. Runtime-generated IDs, timestamps, session data, and metadata.
 10. Content embedding with `text-embedding-3-small`.
 11. Persistent storage in ChromaDB.
+
+
 
 ### Read Path
 
@@ -153,6 +162,8 @@ The current Read Path contains retrieval filters and a context engine:
 14. The ordered memories are formatted into the main-model instructions.
 15. The conversation itself stays in the Responses API `input` parameter.
 
+
+
 ## Write Path
 
 The runtime decides when to write memory. The public `memory_add()` operation
@@ -172,6 +183,8 @@ flowchart TD
     J --> K[Encode metadata]
     K --> L[Store in Chroma]
 ```
+
+
 
 After every successful main-model response, the runtime passes the current
 conversation to `memory_add()`. The memory selector sees raw transcript
@@ -261,6 +274,8 @@ Typical information not to store:
 - Speculation or unconfirmed claims
 - Passwords, API keys, access tokens, credentials, or other secrets
 
+
+
 ## Memory Types
 
 - `fact`: stable information presented as true
@@ -336,6 +351,10 @@ flowchart TD
     S --> T[Format memory context]
     T --> U[Main-model instructions]
 ```
+
+
+
+
 
 ### First Filter: Weighted Retrieval Score
 
@@ -520,3 +539,4 @@ after deduplication, context ordering, prompt formatting, and V0
 - The main model has no direct memory tools.
 - Ordered transcripts are not persisted outside Streamlit session state.
 - Retrieval scores, clusters, and compressed text are not stored, so they cannot be inspected after the debug session ends.
+

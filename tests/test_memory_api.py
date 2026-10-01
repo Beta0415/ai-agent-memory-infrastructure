@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from ai_agent_memory_infrastructure.memory_api import AgentMemory
+from ai_agent_memory_infrastructure.memory_api import (
+    AgentMemory,
+    ReadPathSettings,
+)
 from ai_agent_memory_infrastructure.memory_context import (
     CONTEXT_DUPLICATE_SIMILARITY,
     CONTEXT_TOKEN_BUDGET,
@@ -966,6 +969,74 @@ class ScriptedReranker:
             candidate.memory.id: self.scores[candidate.memory.id]
             for candidate in candidates
         }
+
+
+class ReadPathSettingsTest(unittest.TestCase):
+    def test_rejects_weights_that_do_not_sum_to_one(self) -> None:
+        with self.assertRaises(ValueError):
+            ReadPathSettings(
+                semantic_weight=0.5,
+                recency_weight=0.5,
+                importance_weight=0.5,
+            )
+
+    def test_rejects_cuts_out_of_order(self) -> None:
+        with self.assertRaises(ValueError):
+            ReadPathSettings(
+                candidate_limit=5,
+                weighted_limit=8,
+                result_limit=4,
+            )
+
+    def test_custom_settings_change_scoring_and_cuts(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        created_at = now - timedelta(days=10)
+        matches = [
+            MemoryMatch(
+                memory=_memory(
+                    memory_id="older",
+                    content="An older fact.",
+                    importance=0.9,
+                    created_at=created_at,
+                ),
+                similarity_score=0.2,
+            ),
+            MemoryMatch(
+                memory=_memory(
+                    memory_id="closer",
+                    content="A closer fact.",
+                    importance=0.1,
+                    created_at=now,
+                ),
+                similarity_score=0.9,
+            ),
+        ]
+        store = RecordingStore(matches)
+        settings = ReadPathSettings(
+            semantic_weight=0.0,
+            recency_weight=1.0,
+            importance_weight=0.0,
+            recency_half_life_days=10,
+            candidate_limit=2,
+            weighted_limit=2,
+            result_limit=1,
+        )
+
+        result = _read_memory(store).memory_search(
+            "fact",
+            now=now,
+            settings=settings,
+        )
+
+        self.assertEqual(store.search_limit, 2)
+        self.assertEqual(len(result.matches), 1)
+        self.assertEqual(result.matches[0].memory.id, "closer")
+        self.assertAlmostEqual(result.matches[0].recency_score, 1.0)
+        older = next(
+            item for item in result.candidates if item.memory.id == "older"
+        )
+        self.assertAlmostEqual(older.recency_score, 0.5)
+        self.assertAlmostEqual(older.retrieval_score, 0.5)
 
 
 if __name__ == "__main__":
