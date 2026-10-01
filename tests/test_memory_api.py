@@ -6,6 +6,18 @@ import unittest
 from datetime import UTC, datetime, timedelta
 
 from ai_agent_memory_infrastructure.memory_api import AgentMemory
+from ai_agent_memory_infrastructure.memory_context import (
+    CONTEXT_DUPLICATE_SIMILARITY,
+    CONTEXT_TOKEN_BUDGET,
+    apply_context_compression,
+    cluster_duplicate_memories,
+    context_token_count,
+    count_tokens,
+    embedding_similarity,
+    format_context_memories,
+    order_context_memories,
+    resolve_duplicate_group,
+)
 from ai_agent_memory_infrastructure.memory_retrieval import (
     CANDIDATE_RETRIEVAL_LIMIT,
     IMPORTANCE_WEIGHT,
@@ -13,6 +25,7 @@ from ai_agent_memory_infrastructure.memory_retrieval import (
     RECENCY_WEIGHT,
     SEMANTIC_WEIGHT,
     WEIGHTED_CANDIDATE_LIMIT,
+    RetrievedMemory,
     calculate_recency_score,
 )
 from ai_agent_memory_infrastructure.memory_runtime import MemoryRuntime
@@ -195,29 +208,126 @@ class MemoryAPITest(unittest.TestCase):
 
         context = runtime.runtime_build_memory_context("concise")
         self.assertTrue(context.matches)
-        self.assertIn("final=", context.text)
-        self.assertIn("semantic=", context.text)
+        self.assertIn("preference\n- [user; relevance=", context.text)
         self.assertIn("concise", context.text)
+        self.assertNotIn("semantic=", context.text)
         self.assertNotIn("semantic_score", context.matches[0].memory.metadata)
+
+    def test_memory_context_keeps_best_equivalent_embedding(
+        self,
+    ) -> None:
+        classifier = ScriptedRelationClassifier("equivalent")
+        memory_api = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-3",
+            relation_classifier=classifier,
+        )
+        first = self.store.write_memory(
+            "The user prefers Python.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-3",
+            importance=0.6,
+        )
+        second = self.store.write_memory(
+            "The user likes Python a lot.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-3",
+            importance=0.6,
+        )
+        self.store.write_memory(
+            "The user prefers concise answers.",
+            memory_type=MemoryType.PREFERENCE,
+            role="user",
+            source="test",
+            session_id="session-3",
+            importance=0.6,
+        )
+
+        result = memory_api.memory_context("Python")
+
+        self.assertEqual(self.store.count(), 3)
+        self.assertEqual(len(result.matches), 3)
+        self.assertEqual(len(classifier.groups), 1)
+        self.assertEqual(
+            set(classifier.groups[0]),
+            {first.id, second.id},
+        )
+        self.assertEqual(len(result.memories), 2)
+        kept = next(
+            item
+            for item in result.memories
+            if "Python" in item.memory.content
+        )
+        self.assertIn(
+            kept.memory.content,
+            {
+                "The user prefers Python.",
+                "The user likes Python a lot.",
+            },
+        )
+        self.assertEqual(kept.merged_ids, ())
+        concise = next(
+            item
+            for item in result.memories
+            if "concise" in item.memory.content
+        )
+        self.assertEqual(concise.memory.content, "The user prefers concise answers.")
+        self.assertEqual(
+            self.store.memory_get(first.id).content,
+            "The user prefers Python.",
+        )
 
 
 class RecordingStore:
-    def __init__(self, matches: list[MemoryMatch]) -> None:
+    def __init__(
+        self,
+        matches: list[MemoryMatch],
+        embeddings: dict[str, tuple[float, ...]] | None = None,
+    ) -> None:
         self.matches = matches
+        self.embeddings = embeddings
         self.search_limit = None
+        self.embedded_ids: list[str] = []
 
     def memory_search(self, query, *, limit=5, min_similarity=None, filters=None):
         self.search_limit = limit
         return self.matches[:limit]
 
+    def memory_embeddings(self, memory_ids):
+        self.embedded_ids = list(memory_ids)
+        if self.embeddings is not None:
+            return {
+                memory_id: self.embeddings[memory_id]
+                for memory_id in memory_ids
+            }
+        vectors = {}
+        for index, memory_id in enumerate(memory_ids):
+            vector = [0.0] * len(memory_ids)
+            vector[index] = 1.0
+            vectors[memory_id] = tuple(vector)
+        return vectors
 
-def _read_memory(store: RecordingStore, reranker=None) -> AgentMemory:
+
+def _read_memory(
+    store: RecordingStore,
+    reranker=None,
+    compressor=None,
+    relation_classifier=None,
+) -> AgentMemory:
     return AgentMemory(
         store,
         FakeMemorySelector(),
         source="test",
         session_id="session",
         reranker=reranker,
+        compressor=compressor,
+        relation_classifier=relation_classifier,
     )
 
 
@@ -227,12 +337,14 @@ def _memory(
     content: str,
     importance: float,
     created_at: datetime,
+    memory_type: MemoryType = MemoryType.FACT,
+    role: str = "user",
 ) -> Memory:
     return Memory(
         id=memory_id,
         content=content,
-        memory_type=MemoryType.FACT,
-        role="user",
+        memory_type=memory_type,
+        role=role,
         source="test",
         session_id="session",
         importance=importance,
@@ -296,6 +408,7 @@ class ReadPathRankingTest(unittest.TestCase):
         )
 
         self.assertEqual(store.search_limit, CANDIDATE_RETRIEVAL_LIMIT)
+        self.assertFalse(context.deduplicated)
         self.assertEqual(
             [match.memory.id for match in context.matches],
             ["recent-important", "old-similar", "filler-0", "filler-1"],
@@ -313,7 +426,11 @@ class ReadPathRankingTest(unittest.TestCase):
         self.assertAlmostEqual(selected.retrieval_score, expected_final)
         self.assertAlmostEqual(selected.final_score, expected_final)
         self.assertNotIn("final_score", selected.memory.metadata)
-        self.assertIn("final=0.800", context.text)
+        self.assertIn(
+            "fact\n- [user; relevance=0.800; ] A recent important fact.",
+            context.text,
+        )
+        self.assertIn("A recent important fact.", context.text)
 
     def test_reranker_selects_top_4_from_weighted_top_10(self) -> None:
         now = datetime(2026, 9, 30, tzinfo=UTC)
@@ -379,6 +496,462 @@ class ReadPathRankingTest(unittest.TestCase):
                 candidate.rerank_score is None
                 for candidate in context.candidates[WEIGHTED_CANDIDATE_LIMIT:]
             )
+        )
+
+
+def _retrieved(memory: Memory, *, final_score: float) -> RetrievedMemory:
+    return RetrievedMemory(
+        memory=memory,
+        semantic_score=final_score,
+        recency_score=1.0,
+        retrieval_score=final_score,
+        final_score=final_score,
+    )
+
+
+class ContextDedupTest(unittest.TestCase):
+    def test_similarity_above_threshold_merges_and_equal_does_not(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        left = _retrieved(
+            _memory(
+                memory_id="left",
+                content="Alpha fact.",
+                importance=0.5,
+                created_at=now,
+            ),
+            final_score=0.9,
+        )
+        right = _retrieved(
+            _memory(
+                memory_id="right",
+                content="Beta fact.",
+                importance=0.5,
+                created_at=now,
+            ),
+            final_score=0.8,
+        )
+        above = (
+            0.91,
+            math.sqrt(1 - 0.91**2),
+        )
+        at_threshold = (CONTEXT_DUPLICATE_SIMILARITY, math.sqrt(0.19))
+
+        self.assertGreater(
+            embedding_similarity((1.0, 0.0), above),
+            CONTEXT_DUPLICATE_SIMILARITY,
+        )
+        self.assertAlmostEqual(
+            embedding_similarity((1.0, 0.0), at_threshold),
+            CONTEXT_DUPLICATE_SIMILARITY,
+        )
+
+        clustered = cluster_duplicate_memories(
+            [left, right],
+            {"left": (1.0, 0.0), "right": above},
+        )
+        self.assertEqual(len(clustered), 1)
+        self.assertEqual(
+            [item.memory.id for item in clustered[0]],
+            ["left", "right"],
+        )
+        kept = resolve_duplicate_group(clustered[0], "equivalent")
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].memory.id, "left")
+        self.assertEqual(kept[0].final_score, 0.9)
+        self.assertEqual(kept[0].memory.content, "Alpha fact.")
+
+        both = resolve_duplicate_group(clustered[0], "contradictory")
+        self.assertEqual(
+            [item.memory.content for item in both],
+            ["Alpha fact.", "Beta fact."],
+        )
+
+        separate = cluster_duplicate_memories(
+            [left, right],
+            {"left": (1.0, 0.0), "right": at_threshold},
+        )
+        self.assertEqual(len(separate), 2)
+
+    def test_identical_content_is_kept_once(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        memories = [
+            _retrieved(
+                _memory(
+                    memory_id=memory_id,
+                    content="User likes tea.",
+                    importance=0.5,
+                    created_at=now,
+                ),
+                final_score=0.9 - index / 10,
+            )
+            for index, memory_id in enumerate(("one", "two"))
+        ]
+        clustered = cluster_duplicate_memories(
+            memories,
+            {"one": (1.0, 0.0), "two": (1.0, 0.0)},
+        )
+        self.assertEqual(len(clustered), 1)
+        kept = resolve_duplicate_group(clustered[0], "equivalent")
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].memory.id, "one")
+        self.assertEqual(kept[0].memory.content, "User likes tea.")
+
+    def test_linked_duplicates_merge_as_one_group(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        angle = math.acos(0.95)
+        memories = [
+            _retrieved(
+                _memory(
+                    memory_id=memory_id,
+                    content=f"Fact {memory_id}.",
+                    importance=0.5,
+                    created_at=now,
+                ),
+                final_score=0.9 - index / 10,
+            )
+            for index, memory_id in enumerate(("a", "b", "c"))
+        ]
+        embeddings = {
+            "a": (1.0, 0.0),
+            "b": (math.cos(angle), math.sin(angle)),
+            "c": (math.cos(angle * 2), math.sin(angle * 2)),
+        }
+        self.assertLessEqual(
+            embedding_similarity(embeddings["a"], embeddings["c"]),
+            CONTEXT_DUPLICATE_SIMILARITY,
+        )
+        clustered = cluster_duplicate_memories(memories, embeddings)
+        self.assertEqual(len(clustered), 1)
+        self.assertEqual(
+            [item.memory.id for item in clustered[0]],
+            ["a", "b", "c"],
+        )
+        kept = resolve_duplicate_group(clustered[0], "equivalent")
+        self.assertEqual([item.memory.id for item in kept], ["a"])
+        self.assertEqual(kept[0].memory.content, "Fact a.")
+        both = resolve_duplicate_group(clustered[0], "contradictory")
+        self.assertEqual(
+            [item.memory.content for item in both],
+            ["Fact a.", "Fact b.", "Fact c."],
+        )
+
+    def test_memory_context_dedupes_only_search_matches(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        matches = [
+            MemoryMatch(
+                memory=_memory(
+                    memory_id=f"rank-{index:02d}",
+                    content=f"Candidate {index}.",
+                    importance=0.5,
+                    created_at=now,
+                ),
+                similarity_score=1.0 - (index * 0.05),
+            )
+            for index in range(5)
+        ]
+        near = (0.96, math.sqrt(1 - 0.96**2), 0.0)
+        embeddings = {
+            "rank-00": (1.0, 0.0, 0.0),
+            "rank-01": (0.0, 1.0, 0.0),
+            "rank-02": (0.0, 0.0, 1.0),
+            "rank-03": near,
+            "rank-04": (1.0, 0.0, 0.0),
+        }
+        store = RecordingStore(matches, embeddings)
+        classifier = ScriptedRelationClassifier("equivalent")
+        memory_api = _read_memory(
+            store,
+            relation_classifier=classifier,
+        )
+
+        result = memory_api.memory_context("candidate", limit=4, now=now)
+
+        self.assertEqual(
+            store.embedded_ids,
+            [f"rank-{index:02d}" for index in range(4)],
+        )
+        self.assertEqual(classifier.groups, [["rank-00", "rank-03"]])
+        self.assertEqual(len(result.matches), 4)
+        self.assertEqual(len(result.candidates), 5)
+        self.assertEqual(
+            [item.memory.id for item in result.memories],
+            ["rank-00", "rank-01", "rank-02"],
+        )
+        self.assertTrue(result.deduplicated)
+        self.assertEqual(
+            [item.memory.id for item in result.dropped_memories],
+            ["rank-03"],
+        )
+        self.assertEqual(result.memories[0].memory.content, "Candidate 0.")
+        self.assertEqual(len(result.duplicate_clusters), 1)
+        cluster = result.duplicate_clusters[0]
+        self.assertEqual(cluster.relation, "equivalent")
+        self.assertEqual(
+            [item.memory.id for item in cluster.memories],
+            ["rank-00", "rank-03"],
+        )
+        self.assertIsNotNone(cluster.selected)
+        self.assertEqual(cluster.selected.memory.id, "rank-00")
+        self.assertEqual(cluster.selected.memory.content, "Candidate 0.")
+
+    def test_contradictory_cluster_keeps_every_memory(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        matches = [
+            MemoryMatch(
+                memory=_memory(
+                    memory_id=memory_id,
+                    content=content,
+                    importance=0.5,
+                    created_at=now,
+                ),
+                similarity_score=0.9,
+            )
+            for memory_id, content in (
+                ("name", "His name is Beta."),
+                ("negation", "His name is not Beta."),
+            )
+        ]
+        embeddings = {
+            "name": (1.0, 0.0),
+            "negation": (1.0, 0.0),
+        }
+        classifier = ScriptedRelationClassifier("contradictory")
+        memory_api = _read_memory(
+            RecordingStore(matches, embeddings),
+            relation_classifier=classifier,
+        )
+
+        result = memory_api.memory_context("name", now=now)
+
+        self.assertFalse(result.deduplicated)
+        self.assertEqual(len(result.memories), 2)
+        self.assertEqual(len(result.duplicate_clusters), 1)
+        cluster = result.duplicate_clusters[0]
+        self.assertEqual(cluster.relation, "contradictory")
+        self.assertEqual(
+            [item.memory.content for item in cluster.memories],
+            ["His name is Beta.", "His name is not Beta."],
+        )
+        self.assertIsNone(cluster.selected)
+
+
+class ContextOrderingTest(unittest.TestCase):
+    def test_groups_by_type_then_relevance(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        memories = [
+            _retrieved(
+                _memory(
+                    memory_id="pref-high",
+                    content="User wants short answers.",
+                    importance=0.5,
+                    created_at=now,
+                    memory_type=MemoryType.PREFERENCE,
+                ),
+                final_score=0.910,
+            ),
+            _retrieved(
+                _memory(
+                    memory_id="fact-low",
+                    content="Beta lives in New York.",
+                    importance=0.5,
+                    created_at=now,
+                    memory_type=MemoryType.FACT,
+                    role="assistant",
+                ),
+                final_score=0.400,
+            ),
+            _retrieved(
+                _memory(
+                    memory_id="fact-high",
+                    content="The user's name is Beta.",
+                    importance=0.5,
+                    created_at=now,
+                    memory_type=MemoryType.FACT,
+                ),
+                final_score=0.860,
+            ),
+        ]
+
+        ordered = order_context_memories(memories)
+        self.assertEqual(
+            [item.memory.id for item in ordered],
+            ["fact-high", "fact-low", "pref-high"],
+        )
+        self.assertEqual(
+            format_context_memories(memories),
+            "\n".join(
+                [
+                    "fact",
+                    "- [user; relevance=0.860; ] The user's name is Beta.",
+                    "- [assistant; relevance=0.400; ] Beta lives in New York.",
+                    "preference",
+                    "- [user; relevance=0.910; ] User wants short answers.",
+                ]
+            ),
+        )
+
+
+class ScriptedRelationClassifier:
+    def __init__(self, relation: str) -> None:
+        self.relation = relation
+        self.groups: list[list[str]] = []
+
+    def classify(self, memories):
+        self.groups.append([memory.memory.id for memory in memories])
+        return self.relation
+
+
+class ScriptedCompressor:
+    def __init__(self, contents: dict[str, str]) -> None:
+        self.contents = contents
+        self.seen_ids: list[str] = []
+        self.token_budget = None
+
+    def compress(self, memories, *, token_budget):
+        self.seen_ids = [memory.memory.id for memory in memories]
+        self.token_budget = token_budget
+        return {
+            memory.memory.id: self.contents[memory.memory.id]
+            for memory in memories
+        }
+
+
+class ContextCompressionTest(unittest.TestCase):
+    def test_short_context_skips_compression(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        matches = [
+            MemoryMatch(
+                memory=_memory(
+                    memory_id="short",
+                    content="User likes tea.",
+                    importance=0.5,
+                    created_at=now,
+                ),
+                similarity_score=0.9,
+            )
+        ]
+        compressor = ScriptedCompressor({"short": "Likes tea."})
+        memory_api = _read_memory(RecordingStore(matches), compressor=compressor)
+
+        result = memory_api.memory_context("tea", now=now)
+
+        self.assertLessEqual(
+            context_token_count(result.memories),
+            CONTEXT_TOKEN_BUDGET,
+        )
+        self.assertEqual(compressor.seen_ids, [])
+        self.assertEqual(result.memories[0].memory.content, "User likes tea.")
+        self.assertFalse(result.memories[0].compressed)
+
+    def test_over_budget_shortens_after_dedup(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        long_content = (
+            "The user has stated a durable preference for receiving "
+            "detailed written explanations about Python packaging."
+        )
+        duplicate_content = (
+            "The user wants detailed written explanations about "
+            "Python packaging."
+        )
+        matches = [
+            MemoryMatch(
+                memory=_memory(
+                    memory_id="primary",
+                    content=long_content,
+                    importance=0.8,
+                    created_at=now,
+                ),
+                similarity_score=0.95,
+            ),
+            MemoryMatch(
+                memory=_memory(
+                    memory_id="duplicate",
+                    content=duplicate_content,
+                    importance=0.7,
+                    created_at=now,
+                ),
+                similarity_score=0.90,
+            ),
+            MemoryMatch(
+                memory=_memory(
+                    memory_id="outside",
+                    content="This candidate is outside the returned matches.",
+                    importance=0.1,
+                    created_at=now - timedelta(days=10),
+                ),
+                similarity_score=0.10,
+            ),
+        ]
+        embeddings = {
+            "primary": (1.0, 0.0),
+            "duplicate": (1.0, 0.0),
+            "outside": (0.0, 1.0),
+        }
+        shortened = "User wants detailed Python packaging explanations."
+        compressor = ScriptedCompressor({"primary": shortened})
+        classifier = ScriptedRelationClassifier("equivalent")
+        store = RecordingStore(matches, embeddings)
+        memory_api = _read_memory(
+            store,
+            compressor=compressor,
+            relation_classifier=classifier,
+        )
+        token_budget = count_tokens(long_content) - 1
+
+        result = memory_api.memory_context(
+            "python packaging",
+            limit=2,
+            now=now,
+            token_budget=token_budget,
+        )
+
+        self.assertEqual(classifier.groups, [["primary", "duplicate"]])
+        self.assertEqual(compressor.seen_ids, ["primary"])
+        self.assertEqual(compressor.token_budget, token_budget)
+        self.assertEqual(len(result.memories), 1)
+        self.assertEqual(result.memories[0].memory.content, shortened)
+        self.assertTrue(result.memories[0].compressed)
+        self.assertEqual(result.memories[0].memory.id, "primary")
+        self.assertEqual(len(result.duplicate_clusters), 1)
+        cluster = result.duplicate_clusters[0]
+        self.assertEqual(cluster.relation, "equivalent")
+        self.assertEqual(cluster.selected.memory.content, long_content)
+
+    def test_longer_compression_is_discarded(self) -> None:
+        now = datetime(2026, 9, 30, tzinfo=UTC)
+        original = "User likes tea."
+        memory = _retrieved(
+            _memory(
+                memory_id="tea",
+                content=original,
+                importance=0.5,
+                created_at=now,
+            ),
+            final_score=0.8,
+        )
+        expanded = apply_context_compression(
+            [memory],
+            {
+                "tea": (
+                    "The user has a lasting personal preference for drinking tea "
+                    "every afternoon."
+                )
+            },
+        )
+        self.assertEqual(expanded[0].memory.content, original)
+        self.assertFalse(expanded[0].compressed)
+
+        shortened = apply_context_compression(
+            [memory],
+            {"tea": "Likes tea."},
+        )
+        self.assertEqual(shortened[0].memory.content, "Likes tea.")
+        self.assertTrue(shortened[0].compressed)
+        self.assertLess(
+            count_tokens("Likes tea."),
+            count_tokens(original),
         )
 
 

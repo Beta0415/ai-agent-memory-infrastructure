@@ -6,6 +6,21 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
+from ai_agent_memory_infrastructure.memory_compressor import (
+    MemoryCompressor,
+)
+from ai_agent_memory_infrastructure.memory_context import (
+    CONTEXT_TOKEN_BUDGET,
+    DuplicateCluster,
+    apply_context_compression,
+    cluster_duplicate_memories,
+    context_token_count,
+    order_context_memories,
+    resolve_duplicate_group,
+)
+from ai_agent_memory_infrastructure.memory_relation import (
+    MemoryRelationClassifier,
+)
 from ai_agent_memory_infrastructure.memory_retrieval import (
     CANDIDATE_RETRIEVAL_LIMIT,
     DEFAULT_RESULT_LIMIT,
@@ -34,6 +49,16 @@ class MemorySearchResult:
 
 
 @dataclass(frozen=True)
+class MemoryContextResult:
+    memories: tuple[RetrievedMemory, ...]
+    matches: tuple[RetrievedMemory, ...]
+    candidates: tuple[RetrievedMemory, ...]
+    deduplicated: bool = False
+    dropped_memories: tuple[RetrievedMemory, ...] = ()
+    duplicate_clusters: tuple[DuplicateCluster, ...] = ()
+
+
+@dataclass(frozen=True)
 class MemoryAddResult:
     selection: MemorySelectionOutput
     stored_memories: tuple[Memory, ...]
@@ -54,6 +79,17 @@ class MemoryAPI(Protocol):
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
     ) -> MemorySearchResult: ...
+
+    def memory_context(
+        self,
+        query: str,
+        *,
+        limit: int = DEFAULT_RESULT_LIMIT,
+        min_similarity: float | None = None,
+        filters: MemoryFilters | None = None,
+        now: datetime | None = None,
+        token_budget: int = CONTEXT_TOKEN_BUDGET,
+    ) -> MemoryContextResult: ...
 
     def memory_get(self, memory_id: str) -> Memory | None: ...
 
@@ -82,10 +118,14 @@ class AgentMemory:
         source: str,
         session_id: str,
         reranker: MemoryReranker | None = None,
+        compressor: MemoryCompressor | None = None,
+        relation_classifier: MemoryRelationClassifier | None = None,
     ) -> None:
         self._store = store
         self._selector = selector
         self._reranker = reranker
+        self._compressor = compressor
+        self._relation_classifier = relation_classifier
         self._source = source
         self._session_id = session_id
 
@@ -163,6 +203,88 @@ class AgentMemory:
         return MemorySearchResult(
             matches=tuple(reranked[:limit]),
             candidates=candidates,
+        )
+
+    def memory_context(
+        self,
+        query: str,
+        *,
+        limit: int = DEFAULT_RESULT_LIMIT,
+        min_similarity: float | None = None,
+        filters: MemoryFilters | None = None,
+        now: datetime | None = None,
+        token_budget: int = CONTEXT_TOKEN_BUDGET,
+    ) -> MemoryContextResult:
+        if token_budget < 1:
+            raise ValueError("Memory token budget must be at least 1.")
+        search = self.memory_search(
+            query,
+            limit=limit,
+            min_similarity=min_similarity,
+            filters=filters,
+            now=now,
+        )
+        if not search.matches:
+            return MemoryContextResult(
+                memories=(),
+                matches=(),
+                candidates=search.candidates,
+            )
+        embeddings = self._store.memory_embeddings(
+            [item.memory.id for item in search.matches]
+        )
+        groups = cluster_duplicate_memories(
+            search.matches,
+            embeddings,
+        )
+        kept: list[RetrievedMemory] = []
+        duplicate_clusters: list[DuplicateCluster] = []
+        for group in groups:
+            if len(group) < 2:
+                kept.extend(group)
+                continue
+            if self._relation_classifier is None:
+                raise RuntimeError(
+                    "Near-duplicate memories need a relation classifier."
+                )
+            relation = self._relation_classifier.classify(group)
+            resolved = resolve_duplicate_group(group, relation)
+            kept.extend(resolved)
+            label = relation.strip().lower()
+            duplicate_clusters.append(
+                DuplicateCluster(
+                    memories=tuple(group),
+                    relation=label,
+                    selected=resolved[0] if label == "equivalent" else None,
+                )
+            )
+        memories = tuple(kept)
+        kept_ids = {item.memory.id for item in memories}
+        dropped_memories = tuple(
+            item
+            for item in search.matches
+            if item.memory.id not in kept_ids
+        )
+        deduplicated = len(dropped_memories) > 0
+        if context_token_count(memories) > token_budget:
+            if self._compressor is None:
+                raise RuntimeError(
+                    "Memory context exceeds the token budget and no "
+                    "compressor is configured."
+                )
+            compressed = self._compressor.compress(
+                memories,
+                token_budget=token_budget,
+            )
+            memories = apply_context_compression(memories, compressed)
+        memories = order_context_memories(memories)
+        return MemoryContextResult(
+            memories=memories,
+            matches=search.matches,
+            candidates=search.candidates,
+            deduplicated=deduplicated,
+            dropped_memories=dropped_memories,
+            duplicate_clusters=tuple(duplicate_clusters),
         )
 
     def memory_get(self, memory_id: str) -> Memory | None:

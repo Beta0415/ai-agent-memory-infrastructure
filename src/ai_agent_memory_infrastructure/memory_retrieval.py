@@ -27,6 +27,8 @@ class RetrievedMemory:
     retrieval_score: float
     final_score: float
     rerank_score: float | None = None
+    merged_ids: tuple[str, ...] = ()
+    compressed: bool = False
 
 
 class MemoryReranker(Protocol):

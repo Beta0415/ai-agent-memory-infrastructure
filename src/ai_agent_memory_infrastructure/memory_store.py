@@ -323,6 +323,45 @@ class ChromaMemoryStore:
             )
         return matches
 
+    def memory_embeddings(
+        self,
+        memory_ids: Sequence[str],
+    ) -> dict[str, tuple[float, ...]]:
+        if not memory_ids:
+            return {}
+        result = self._collection.get(
+            ids=list(memory_ids),
+            include=["embeddings"],
+        )
+        raw_embeddings = result.get("embeddings")
+        ids = result.get("ids") or []
+        if raw_embeddings is None:
+            raise RuntimeError("Stored memory embeddings are unavailable.")
+        if hasattr(raw_embeddings, "tolist") and not isinstance(
+            raw_embeddings, list
+        ):
+            raw_embeddings = raw_embeddings.tolist()
+
+        found: dict[str, tuple[float, ...]] = {}
+        for memory_id, embedding in zip(ids, raw_embeddings, strict=True):
+            if embedding is None:
+                continue
+            if hasattr(embedding, "tolist"):
+                embedding = embedding.tolist()
+            found[memory_id] = tuple(float(value) for value in embedding)
+
+        missing = [
+            memory_id
+            for memory_id in memory_ids
+            if memory_id not in found
+        ]
+        if missing:
+            raise RuntimeError(
+                "Stored memory embeddings are missing: "
+                + ", ".join(missing)
+            )
+        return found
+
     def memory_get(self, memory_id: str) -> Memory | None:
         result = self._collection.get(
             ids=[memory_id],

@@ -8,6 +8,10 @@ from ai_agent_memory_infrastructure.memory_api import (
     MemoryAddResult,
     MemoryAPI,
 )
+from ai_agent_memory_infrastructure.memory_context import (
+    DuplicateCluster,
+    format_context_memories,
+)
 from ai_agent_memory_infrastructure.memory_retrieval import (
     DEFAULT_RESULT_LIMIT,
     RetrievedMemory,
@@ -20,6 +24,9 @@ class MemoryContext:
     text: str
     matches: tuple[RetrievedMemory, ...]
     candidates: tuple[RetrievedMemory, ...]
+    deduplicated: bool = False
+    dropped_memories: tuple[RetrievedMemory, ...] = ()
+    duplicate_clusters: tuple[DuplicateCluster, ...] = ()
 
 
 class MemoryRuntime:
@@ -35,28 +42,22 @@ class MemoryRuntime:
         filters: MemoryFilters | None = None,
         now: datetime | None = None,
     ) -> MemoryContext:
-        result = self._memory_api.memory_search(
+        result = self._memory_api.memory_context(
             query,
             limit=limit,
             min_similarity=min_similarity,
             filters=filters,
             now=now,
         )
-        matches = result.matches
-        text = "\n".join(
-            (
-                f"- [{match.memory.memory_type.value}; "
-                f"{match.memory.role}; "
-                f"final={match.final_score:.3f}; "
-                f"semantic={match.semantic_score:.3f}] "
-                f"{match.memory.content}"
-            )
-            for match in matches
-        )
+        matches = result.memories
+        text = format_context_memories(matches)
         return MemoryContext(
             text=text,
             matches=matches,
             candidates=result.candidates,
+            deduplicated=result.deduplicated,
+            dropped_memories=result.dropped_memories,
+            duplicate_clusters=result.duplicate_clusters,
         )
 
     def runtime_write_memory(
