@@ -7,7 +7,6 @@ from typing import Protocol
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_agent_memory_infrastructure.memory_context import count_tokens
 from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
 
 
@@ -81,7 +80,7 @@ class OpenAIMemoryCompressor:
             "memories": [
                 {
                     "memory_id": memory.memory.id,
-                    "tokens": count_tokens(memory.memory.content),
+                    "tokens": memory.memory.token_count,
                     "content": memory.memory.content,
                 }
                 for memory in memories

@@ -8,9 +8,12 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "chromadb>=1.5.9",
+    "en-core-web-sm",
     "openai>=3.19.2",
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.6",
     "python-dotenv>=1.2.3",
+    "spacy>=3.8.16",
     "streamlit>=1.64.0",
     "tiktoken>=0.14.0",
     "watchdog>=6.0.0",
@@ -22,3 +25,6 @@ ai-agent-memory-infrastructure = "ai_agent_memory_infrastructure:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }

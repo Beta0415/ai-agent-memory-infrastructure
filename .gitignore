@@ -1,6 +1,5 @@
 .venv/
 .env
-.chroma/
 __pycache__/
 *.py[cod]
 .pytest_cache/

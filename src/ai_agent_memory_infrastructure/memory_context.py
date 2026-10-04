@@ -164,7 +164,7 @@ def count_tokens(text: str) -> int:
 
 
 def context_token_count(memories: Sequence[RetrievedMemory]) -> int:
-    return sum(count_tokens(memory.memory.content) for memory in memories)
+    return sum(memory.memory.token_count for memory in memories)
 
 
 def apply_context_compression(
@@ -190,18 +190,19 @@ def apply_context_compression(
 
     compressed: list[RetrievedMemory] = []
     for memory in memories:
-        original = memory.memory.content
         proposed = compressed_contents[memory.memory.id].strip()
-        if (
-            not proposed
-            or count_tokens(proposed) >= count_tokens(original)
-        ):
+        proposed_tokens = count_tokens(proposed)
+        if not proposed or proposed_tokens >= memory.memory.token_count:
             compressed.append(memory)
             continue
         compressed.append(
             replace(
                 memory,
-                memory=replace(memory.memory, content=proposed),
+                memory=replace(
+                    memory.memory,
+                    content=proposed,
+                    token_count=proposed_tokens,
+                ),
                 compressed=True,
             )
         )

@@ -11,10 +11,21 @@ from openai import OpenAI
 from ai_agent_memory_infrastructure.memory_api import (
     AgentMemory,
     ReadPathSettings,
+    WritePathSettings,
 )
-from ai_agent_memory_infrastructure.memory_context import (
-    DuplicateCluster,
-    count_tokens,
+from ai_agent_memory_infrastructure.memory_dedup import (
+    OpenAIMemoryDedupClassifier,
+)
+from ai_agent_memory_infrastructure.memory_context import DuplicateCluster
+from ai_agent_memory_infrastructure.memory_maintenance import (
+    MaintenanceSettings,
+)
+from ai_agent_memory_infrastructure.memory_atomic_checker import (
+    OpenAIMemoryAtomicChecker,
+)
+from ai_agent_memory_infrastructure.memory_candidate_relation import (
+    CANDIDATE_RELATION_EFFECTS,
+    OpenAIMemoryCandidateRelationClassifier,
 )
 from ai_agent_memory_infrastructure.memory_compressor import (
     OpenAIMemoryCompressor,
@@ -30,7 +41,9 @@ from ai_agent_memory_infrastructure.memory_reranker import (
 from ai_agent_memory_infrastructure.memory_selector import (
     OpenAIMemorySelector,
 )
-from ai_agent_memory_infrastructure.memory_store import ChromaMemoryStore
+from ai_agent_memory_infrastructure.postgres_memory_store import (
+    PostgresMemoryStore,
+)
 
 load_dotenv()
 
@@ -42,9 +55,12 @@ st.set_page_config(
 
 
 @st.cache_resource
-def get_memory_store(path: str, embedding_model: str) -> ChromaMemoryStore:
-    return ChromaMemoryStore(
-        path=path,
+def get_memory_store(
+    database_url: str,
+    embedding_model: str,
+) -> PostgresMemoryStore:
+    return PostgresMemoryStore(
+        database_url=database_url,
         api_key=os.environ["OPENAI_API_KEY"],
         embedding_model=embedding_model,
     )
@@ -84,6 +100,113 @@ def get_memory_relation_classifier(
     )
 
 
+@st.cache_resource
+def get_memory_dedup_classifier(model: str) -> OpenAIMemoryDedupClassifier:
+    return OpenAIMemoryDedupClassifier(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
+def get_memory_atomic_checker(model: str) -> OpenAIMemoryAtomicChecker:
+    return OpenAIMemoryAtomicChecker(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
+def get_memory_candidate_relation_classifier(
+    model: str,
+) -> OpenAIMemoryCandidateRelationClassifier:
+    return OpenAIMemoryCandidateRelationClassifier(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+def _candidate_relation_label(relation: str) -> str:
+    labels = {
+        "equivalent": "Equivalent",
+        "refinement": "Refinement",
+        "supersession": "Supersession",
+        "correction": "Correction",
+        "contradiction": "Contradiction",
+        "related_distinct": "Related Distinct",
+    }
+    return labels.get(relation, relation)
+
+
+def _memory_status_label(status: str) -> str:
+    labels = {
+        "active": "Active",
+        "superseded": "Superseded",
+        "corrected": "Corrected",
+        "conflicted": "Conflicted",
+    }
+    return labels.get(status, status)
+
+
+def _selected_debug_record(candidate, decision) -> dict[str, object]:
+    effect = None
+    if isinstance(decision.relation, str):
+        effect = CANDIDATE_RELATION_EFFECTS.get(decision.relation)
+    previous_status = "active"
+    if effect is not None and effect.previous_status is not None:
+        previous_status = effect.previous_status.value
+    return {
+        **candidate.model_dump(mode="json"),
+        "should_store": True,
+        "relation": decision.relation,
+        "stored": decision.stored is not None,
+        "status": (
+            None
+            if decision.stored is None
+            else decision.stored.status.value
+        ),
+        "links": [
+            {
+                "from_memory_id": link.from_memory_id,
+                "relation": link.relation.value,
+                "to_memory_id": link.to_memory_id,
+            }
+            for link in decision.links
+        ],
+        "related": [
+            {
+                "id": match.memory.id,
+                "content": match.memory.content,
+                "similarity": match.similarity_score,
+                "status": previous_status,
+            }
+            for match in decision.related
+        ],
+        **_atomic_score_fields(decision.atomic_score),
+        "atomic_verdict": decision.atomic_verdict,
+    }
+
+
+def _atomic_score_fields(score) -> dict[str, object]:
+    if score is None:
+        return {}
+    return {
+        "atomic_score": score.score,
+        "P": score.predicate,
+        "L": score.coordinated_items,
+        "C": score.clause,
+        "J": score.coordination,
+        "V": score.value,
+        "T": score.tokens,
+        "n_P": score.predicate_count,
+        "n_L": score.coordinated_item_count,
+        "n_C": score.clause_count,
+        "n_J": score.coordination_count,
+        "n_V": score.value_count,
+        "n_T": score.token_count,
+    }
+
+
 def serialize_memory_match(match: RetrievedMemory) -> dict[str, object]:
     memory = match.memory
     return {
@@ -103,6 +226,8 @@ def serialize_memory_match(match: RetrievedMemory) -> dict[str, object]:
         "created_at": memory.created_at.isoformat(),
         "updated_at": memory.updated_at.isoformat(),
         "metadata": memory.metadata,
+        "status": memory.status.value,
+        "token_count": memory.token_count,
     }
 
 
@@ -158,12 +283,88 @@ def render_debug_cards(
             )
         st.markdown(f"**{index}. [{memory_type}] {role}** · {extra}")
         st.write(content)
+        subject = record.get("subject")
+        predicate = record.get("predicate")
+        relation_object = record.get("object")
+        if subject or predicate or relation_object:
+            st.caption(f"Subject: {subject}")
+            st.caption(f"Predicate: {predicate}")
+            st.caption(f"Object: {relation_object}")
+        if record.get("atomic_score") is not None:
+            st.caption(
+                f"Atomic Score: {float(record['atomic_score']):.3f}"
+            )
+            st.caption(
+                "P {P:.3f} · L {L:.3f} · C {C:.3f} · "
+                "J {J:.3f} · V {V:.3f} · T {T:.3f}".format(
+                    P=float(record.get("P", 0.0)),
+                    L=float(record.get("L", 0.0)),
+                    C=float(record.get("C", 0.0)),
+                    J=float(record.get("J", 0.0)),
+                    V=float(record.get("V", 0.0)),
+                    T=float(record.get("T", 0.0)),
+                )
+            )
+            st.caption(
+                "Counts: P {n_P} · L {n_L} · C {n_C} · "
+                "J {n_J} · V {n_V} · T {n_T}".format(
+                    n_P=int(record.get("n_P", 0)),
+                    n_L=int(record.get("n_L", 0)),
+                    n_C=int(record.get("n_C", 0)),
+                    n_J=int(record.get("n_J", 0)),
+                    n_V=int(record.get("n_V", 0)),
+                    n_T=int(record.get("n_T", 0)),
+                )
+            )
         reason = record.get("debug_reason")
         quote = record.get("debug_source_quote")
         if reason:
             st.caption(f"Reason: {reason}")
         if quote:
             st.caption(f"Quote: {quote}")
+        if kind == "selected" and "stored" in record:
+            relation = record.get("relation")
+            verdict = record.get("atomic_verdict")
+            if verdict == "valid":
+                st.caption("Atomic Check: Valid")
+            elif verdict == "invalid":
+                st.caption("Atomic Check: Invalid")
+            if isinstance(relation, str) and relation:
+                st.caption(
+                    "Relation: "
+                    f"{_candidate_relation_label(relation)}"
+                )
+            if relation == "equivalent" or verdict == "invalid":
+                st.caption("Write: Discarded")
+            else:
+                status = record.get("status")
+                if isinstance(status, str) and status:
+                    st.caption(f"Status: {_memory_status_label(status)}")
+                elif record.get("stored") is True:
+                    st.caption("Status: Active")
+            links = record.get("links")
+            if isinstance(links, list):
+                for link in links:
+                    if not isinstance(link, dict):
+                        continue
+                    st.caption(f"Link: {link.get('relation', '')}")
+            related = record.get("related")
+            if isinstance(related, list) and related:
+                st.caption("Related Memories")
+                for item in related:
+                    if not isinstance(item, dict):
+                        continue
+                    related_status = item.get("status")
+                    status_label = (
+                        _memory_status_label(str(related_status))
+                        if isinstance(related_status, str) and related_status
+                        else ""
+                    )
+                    prefix = f"{status_label} · " if status_label else ""
+                    st.caption(
+                        f"{float(item.get('similarity', 0.0)):.3f} · "
+                        f"{prefix}{item.get('content', '')}"
+                    )
         with st.expander("Full Record"):
             st.json(record)
         if index < len(records):
@@ -333,7 +534,7 @@ def _render_context_summary(assistant_message: dict[str, object]) -> None:
     if not isinstance(retrieved, list):
         retrieved = []
     memory_tokens = sum(
-        count_tokens(str(record.get("content", "")))
+        int(record.get("token_count", 0))
         for record in retrieved
         if isinstance(record, dict)
     )
@@ -423,7 +624,7 @@ def _render_score_table(assistant_message: dict[str, object]) -> None:
             "Importance": _score_text(record.get("importance")),
             "Rerank": _score_text(record.get("rerank_score")),
             "Tokens": (
-                str(count_tokens(str(record.get("content", ""))))
+                str(int(record.get("token_count", 0)))
                 if selected
                 else "—"
             ),
@@ -476,6 +677,24 @@ def current_read_path_settings() -> ReadPathSettings:
     return settings
 
 
+def current_maintenance_settings() -> MaintenanceSettings:
+    settings = st.session_state.get("maintenance_settings")
+    if isinstance(settings, MaintenanceSettings):
+        return settings
+    settings = MaintenanceSettings()
+    st.session_state.maintenance_settings = settings
+    return settings
+
+
+def current_write_path_settings() -> WritePathSettings:
+    settings = st.session_state.get("write_path_settings")
+    if isinstance(settings, WritePathSettings):
+        return settings
+    settings = WritePathSettings()
+    st.session_state.write_path_settings = settings
+    return settings
+
+
 def generate_assistant_turn(
     prompt: str,
     *,
@@ -483,6 +702,7 @@ def generate_assistant_turn(
     model: str,
     memory_runtime: MemoryRuntime | None,
     settings: ReadPathSettings | None = None,
+    write_settings: WritePathSettings | None = None,
 ) -> dict[str, object] | None:
     memory_context = ""
     retrieved_memories: list[dict[str, object]] = []
@@ -577,21 +797,29 @@ def generate_assistant_turn(
                         *st.session_state.messages,
                         assistant_message,
                     ]
-                ]
+                ],
+                settings=write_settings,
+                maintenance_settings=current_maintenance_settings(),
             )
             memory_write_debug["selected"] = [
-                {
-                    **candidate.model_dump(mode="json"),
-                    "should_store": True,
-                }
-                for candidate in write_result.selection.selected
+                _selected_debug_record(candidate, decision)
+                for candidate, decision in zip(
+                    write_result.selection.selected,
+                    write_result.decisions,
+                    strict=True,
+                )
             ]
             memory_write_debug["not_selected"] = [
                 {
                     **candidate.model_dump(mode="json"),
                     "should_store": False,
+                    **_atomic_score_fields(score),
                 }
-                for candidate in write_result.selection.not_selected
+                for candidate, score in zip(
+                    write_result.selection.not_selected,
+                    write_result.not_selected_scores,
+                    strict=True,
+                )
             ]
             memory_write_debug["stored_count"] = len(
                 write_result.stored_memories
@@ -608,7 +836,9 @@ def generate_assistant_turn(
 
 
 api_key = os.getenv("OPENAI_API_KEY", "").strip()
-chroma_path = os.getenv("CHROMA_PATH", ".chroma")
+database_url = os.getenv(
+    "DATABASE_URL", "postgresql://localhost:5432/agent_memory"
+)
 embedding_model = os.getenv(
     "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
 )
@@ -624,21 +854,44 @@ memory_compressor_model = os.getenv(
 memory_relation_model = os.getenv(
     "MEMORY_RELATION_MODEL", "gpt-5-mini"
 )
+memory_candidate_relation_model = os.getenv(
+    "MEMORY_CANDIDATE_RELATION_MODEL", "gpt-5-mini"
+)
+memory_atomic_checker_model = os.getenv(
+    "MEMORY_ATOMIC_CHECKER_MODEL", "gpt-5-mini"
+)
+memory_dedup_model = os.getenv(
+    "MEMORY_DEDUP_MODEL", "gpt-5-mini"
+)
 
 memory_store = None
 memory_selector = None
 memory_reranker = None
 memory_compressor = None
 memory_relation_classifier = None
+memory_candidate_relation_classifier = None
+memory_atomic_checker = None
+memory_dedup_classifier = None
 memory_error = None
 if api_key:
     try:
-        memory_store = get_memory_store(chroma_path, embedding_model)
+        memory_store = get_memory_store(database_url, embedding_model)
         memory_selector = get_memory_selector(memory_selector_model)
         memory_reranker = get_memory_reranker(memory_reranker_model)
         memory_compressor = get_memory_compressor(memory_compressor_model)
         memory_relation_classifier = get_memory_relation_classifier(
             memory_relation_model
+        )
+        memory_candidate_relation_classifier = (
+            get_memory_candidate_relation_classifier(
+                memory_candidate_relation_model
+            )
+        )
+        memory_atomic_checker = get_memory_atomic_checker(
+            memory_atomic_checker_model
+        )
+        memory_dedup_classifier = get_memory_dedup_classifier(
+            memory_dedup_model
         )
     except Exception as exc:
         memory_error = str(exc)
@@ -652,6 +905,10 @@ if "memory_session_id" not in st.session_state:
     st.session_state.memory_session_id = uuid4().hex
 if "read_path_settings" not in st.session_state:
     st.session_state.read_path_settings = ReadPathSettings()
+if "write_path_settings" not in st.session_state:
+    st.session_state.write_path_settings = WritePathSettings()
+if "maintenance_settings" not in st.session_state:
+    st.session_state.maintenance_settings = MaintenanceSettings()
 
 memory_api = (
     AgentMemory(
@@ -662,6 +919,11 @@ memory_api = (
         reranker=memory_reranker,
         compressor=memory_compressor,
         relation_classifier=memory_relation_classifier,
+        candidate_relation_classifier=(
+            memory_candidate_relation_classifier
+        ),
+        atomic_checker=memory_atomic_checker,
+        dedup_classifier=memory_dedup_classifier,
     )
     if (
         memory_store
@@ -669,6 +931,9 @@ memory_api = (
         and memory_reranker
         and memory_compressor
         and memory_relation_classifier
+        and memory_candidate_relation_classifier
+        and memory_atomic_checker
+        and memory_dedup_classifier
     )
     else None
 )
@@ -697,8 +962,24 @@ with st.sidebar:
     st.caption(
         f"Current Session: `{st.session_state.memory_session_id[:8]}`"
     )
-    if memory_api:
+    if memory_api and memory_runtime:
         st.metric("Saved Memories", memory_api.count())
+        st.metric("Memory Tokens", memory_api.memory_total_tokens())
+        if st.button("Run Maintenance", use_container_width=True):
+            maintained = memory_runtime.runtime_run_maintenance(
+                maintenance_settings=current_maintenance_settings(),
+            )
+            st.session_state.maintenance_message = (
+                f"Expired {maintained.expired_count} Memories · "
+                f"Removed {maintained.removed_count} Duplicates"
+            )
+            st.rerun()
+        maintenance_message = st.session_state.pop(
+            "maintenance_message",
+            None,
+        )
+        if maintenance_message:
+            st.caption(str(maintenance_message))
         if st.button("Clear Saved Memories", use_container_width=True):
             memory_api.clear()
             st.rerun()
@@ -739,6 +1020,7 @@ if prompt:
             model=model,
             memory_runtime=memory_runtime,
             settings=current_read_path_settings(),
+            write_settings=current_write_path_settings(),
         )
     if assistant_message:
         st.session_state.messages.append(assistant_message)

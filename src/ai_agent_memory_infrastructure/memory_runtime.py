@@ -8,6 +8,11 @@ from ai_agent_memory_infrastructure.memory_api import (
     MemoryAddResult,
     MemoryAPI,
     ReadPathSettings,
+    WritePathSettings,
+)
+from ai_agent_memory_infrastructure.memory_maintenance import (
+    MaintenanceResult,
+    MaintenanceSettings,
 )
 from ai_agent_memory_infrastructure.memory_context import (
     DuplicateCluster,
@@ -66,5 +71,23 @@ class MemoryRuntime:
     def runtime_write_memory(
         self,
         conversation: Sequence[Mapping[str, str]],
+        *,
+        settings: WritePathSettings | None = None,
+        maintenance_settings: MaintenanceSettings | None = None,
     ) -> MemoryAddResult:
-        return self._memory_api.memory_add(conversation)
+        result = self._memory_api.memory_add(conversation, settings=settings)
+        active_maintenance = maintenance_settings or MaintenanceSettings()
+        if self._memory_api.memory_total_tokens() > active_maintenance.token_capacity:
+            self._memory_api.memory_maintain(settings=active_maintenance)
+        return result
+
+    def runtime_run_maintenance(
+        self,
+        *,
+        now: datetime | None = None,
+        maintenance_settings: MaintenanceSettings | None = None,
+    ) -> MaintenanceResult:
+        return self._memory_api.memory_maintain(
+            now=now,
+            settings=maintenance_settings,
+        )

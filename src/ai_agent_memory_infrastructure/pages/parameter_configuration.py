@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import streamlit as st
 
-from ai_agent_memory_infrastructure.memory_api import ReadPathSettings
+from ai_agent_memory_infrastructure.memory_api import (
+    ReadPathSettings,
+    WritePathSettings,
+)
+from ai_agent_memory_infrastructure.memory_maintenance import (
+    MaintenanceSettings,
+)
 
 st.set_page_config(
     page_title="Parameter Configuration",
@@ -34,11 +40,51 @@ _seed("param_result_limit", applied.result_limit)
 _seed("param_duplicate_similarity", applied.duplicate_similarity)
 _seed("param_token_budget", applied.token_budget)
 
+write_applied = st.session_state.get("write_path_settings")
+if not isinstance(write_applied, WritePathSettings):
+    write_applied = WritePathSettings()
+    st.session_state.write_path_settings = write_applied
+
+_seed("param_predicate_weight", write_applied.predicate_weight)
+_seed("param_list_weight", write_applied.list_weight)
+_seed("param_clause_weight", write_applied.clause_weight)
+_seed("param_coordination_weight", write_applied.coordination_weight)
+_seed("param_value_weight", write_applied.value_weight)
+_seed("param_length_weight", write_applied.length_weight)
+_seed("param_related_similarity", write_applied.related_similarity)
+_seed("param_related_limit", write_applied.related_limit)
+_seed(
+    "param_atomic_score_threshold",
+    write_applied.atomic_score_threshold,
+)
+
+maintenance_applied = st.session_state.get("maintenance_settings")
+if not isinstance(maintenance_applied, MaintenanceSettings):
+    maintenance_applied = MaintenanceSettings()
+    st.session_state.maintenance_settings = maintenance_applied
+_seed("param_token_capacity", maintenance_applied.token_capacity)
+_seed(
+    "param_dedup_similarity",
+    maintenance_applied.similarity_threshold,
+)
+_seed(
+    "param_dedup_importance_weight",
+    maintenance_applied.importance_weight,
+)
+_seed(
+    "param_dedup_recency_weight",
+    maintenance_applied.recency_weight,
+)
+_seed(
+    "param_dedup_half_life_days",
+    float(maintenance_applied.half_life_days),
+)
+
 st.title("Parameter Configuration")
 if st.button("Back To Chat"):
     st.switch_page("app.py")
 
-st.subheader("Weights")
+st.subheader("Retrieval Weights")
 semantic_column, recency_column, importance_column = st.columns(3)
 with semantic_column:
     st.number_input(
@@ -141,8 +187,176 @@ st.caption(
     "Counts memory content only. Compression runs when the total is over this limit."
 )
 
+st.subheader("Atomic Score Weights")
+predicate_column, list_column, clause_column = st.columns(3)
+coordination_column, value_column, length_column = st.columns(3)
+with predicate_column:
+    st.number_input(
+        "Predicate Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_predicate_weight",
+    )
+with list_column:
+    st.number_input(
+        "List Item Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_list_weight",
+    )
+with clause_column:
+    st.number_input(
+        "Clause Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_clause_weight",
+    )
+with coordination_column:
+    st.number_input(
+        "Coordination Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_coordination_weight",
+    )
+with value_column:
+    st.number_input(
+        "Value Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_value_weight",
+    )
+with length_column:
+    st.number_input(
+        "Length Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_length_weight",
+    )
+atomic_weight_sum = (
+    float(st.session_state.param_predicate_weight)
+    + float(st.session_state.param_list_weight)
+    + float(st.session_state.param_clause_weight)
+    + float(st.session_state.param_coordination_weight)
+    + float(st.session_state.param_value_weight)
+    + float(st.session_state.param_length_weight)
+)
+st.caption(f"Sum: {atomic_weight_sum:.2f}")
+st.caption("These weights must sum to 1.")
+st.number_input(
+    "Atomic Score Threshold",
+    min_value=0.0,
+    max_value=1.0,
+    step=0.01,
+    format="%.2f",
+    key="param_atomic_score_threshold",
+)
+st.caption(
+    "A score at or above this value is sent to the atomic checker. "
+    "A lower score continues to memory comparison."
+)
+
+st.subheader("Memory Comparison")
+similarity_column, limit_column = st.columns(2)
+with similarity_column:
+    st.number_input(
+        "Related Similarity",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_related_similarity",
+    )
+with limit_column:
+    st.number_input(
+        "Related Memories",
+        min_value=1,
+        max_value=200,
+        step=1,
+        key="param_related_limit",
+    )
+st.caption(
+    "A new memory is compared with at most this many stored memories "
+    "whose similarity is greater than the threshold."
+)
+
+st.subheader("Maintenance")
+st.number_input(
+    "Memory Token Capacity",
+    min_value=1,
+    max_value=10_000_000,
+    step=100,
+    key="param_token_capacity",
+)
+st.caption(
+    "Maintenance runs when stored memory tokens exceed this capacity. "
+    "A memory is tagged Expired after 60 days without a create, "
+    "update, retrieval, or reinforcement. Its status stays unchanged."
+)
+st.number_input(
+    "Dedup Similarity",
+    min_value=0.0,
+    max_value=1.0,
+    step=0.01,
+    format="%.2f",
+    key="param_dedup_similarity",
+)
+st.caption(
+    "Maintenance groups memories when cosine similarity is greater than this value."
+)
+importance_dedup, recency_dedup, half_life_dedup = st.columns(3)
+with importance_dedup:
+    st.number_input(
+        "Dedup Importance Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_dedup_importance_weight",
+    )
+with recency_dedup:
+    st.number_input(
+        "Dedup Recency Weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_dedup_recency_weight",
+    )
+with half_life_dedup:
+    st.number_input(
+        "Dedup Half-Life Days",
+        min_value=1.0,
+        max_value=3650.0,
+        step=1.0,
+        format="%.0f",
+        key="param_dedup_half_life_days",
+    )
+dedup_weight_sum = (
+    float(st.session_state.param_dedup_importance_weight)
+    + float(st.session_state.param_dedup_recency_weight)
+)
+st.caption(f"Sum: {dedup_weight_sum:.2f}")
+st.caption(
+    "These weights choose which duplicate to keep. Recency ages from "
+    "reinforced_at using this half-life."
+)
+
+read_error = None
+write_error = None
 try:
-    drafted = ReadPathSettings(
+    drafted_read = ReadPathSettings(
         semantic_weight=float(st.session_state.param_semantic_weight),
         recency_weight=float(st.session_state.param_recency_weight),
         importance_weight=float(st.session_state.param_importance_weight),
@@ -158,7 +372,54 @@ try:
         token_budget=int(st.session_state.param_token_budget),
     )
 except ValueError as exc:
+    read_error = str(exc)
+    drafted_read = None
+try:
+    drafted_write = WritePathSettings(
+        predicate_weight=float(st.session_state.param_predicate_weight),
+        list_weight=float(st.session_state.param_list_weight),
+        clause_weight=float(st.session_state.param_clause_weight),
+        coordination_weight=float(
+            st.session_state.param_coordination_weight
+        ),
+        value_weight=float(st.session_state.param_value_weight),
+        length_weight=float(st.session_state.param_length_weight),
+        related_similarity=float(
+            st.session_state.param_related_similarity
+        ),
+        related_limit=int(st.session_state.param_related_limit),
+        atomic_score_threshold=float(
+            st.session_state.param_atomic_score_threshold
+        ),
+    )
+except ValueError as exc:
+    write_error = str(exc)
+    drafted_write = None
+try:
+    drafted_maintenance = MaintenanceSettings(
+        token_capacity=int(st.session_state.param_token_capacity),
+        similarity_threshold=float(st.session_state.param_dedup_similarity),
+        importance_weight=float(
+            st.session_state.param_dedup_importance_weight
+        ),
+        recency_weight=float(st.session_state.param_dedup_recency_weight),
+        half_life_days=float(st.session_state.param_dedup_half_life_days),
+    )
+except ValueError as exc:
     st.error(str(exc))
 else:
-    st.session_state.read_path_settings = drafted
+    st.session_state.maintenance_settings = drafted_maintenance
+
+if read_error:
+    st.error(read_error)
+if write_error:
+    st.error(write_error)
+if (
+    drafted_read is not None
+    and drafted_write is not None
+    and read_error is None
+    and write_error is None
+):
+    st.session_state.read_path_settings = drafted_read
+    st.session_state.write_path_settings = drafted_write
     st.caption("These values apply to the next message.")

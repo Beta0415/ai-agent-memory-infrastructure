@@ -14,6 +14,9 @@ class MemoryCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str = Field(min_length=1, max_length=1000)
+    subject: str = Field(min_length=1, max_length=300)
+    predicate: str = Field(min_length=1, max_length=300)
+    object: str = Field(min_length=1, max_length=300)
     type: MemoryType
     importance: float = Field(ge=0.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
@@ -27,17 +30,18 @@ class MemorySelectionOutput(BaseModel):
 
     selected: list[MemoryCandidate] = Field(
         description=(
-            "Durable statements from the latest exchange that should be "
-            "stored."
+            "Durable atomic memories from the latest exchange. Each item "
+            "is exactly one independently updateable proposition."
         )
     )
     not_selected: list[MemoryCandidate] = Field(
         description=(
-            "Every other semantically meaningful statement in the latest "
-            "user and assistant messages. This includes greetings, small "
-            "talk, one-off questions, temporary details, and generic "
-            "replies. Do not omit them. Leave this empty only when the "
-            "latest exchange contains no non-durable content."
+            "Every other semantically meaningful atomic statement in the "
+            "latest user and assistant messages. Each item is one "
+            "proposition. This includes greetings, small talk, one-off "
+            "questions, temporary details, and generic replies. Do not "
+            "omit them. Leave this empty only when the latest exchange "
+            "contains no non-durable content."
         )
     )
 
@@ -52,12 +56,61 @@ class MemorySelector(Protocol):
     ) -> MemorySelectionOutput: ...
 
 
-MEMORY_SELECTOR_INSTRUCTIONS = """
+ATOMIC_MEMORY_STANDARD = """
+An atomic memory contains exactly one independently updateable proposition.
+If one part could be corrected, superseded, or contradicted without
+changing the rest, split it into separate memories.
+
+Subject, predicate, and object must restate that same proposition and
+nothing else. If the content needs a second subject, predicate, or object,
+it is not atomic.
+
+Atomic does not mean the smallest possible sentence. Keep one proposition
+together, including the qualifiers that belong to it. Do not split a tool
+from the way it is used, a product from its version, or a database from
+its extension when those words state one fact. Do not repeat a proposition
+in different words, and do not register a fragment that has no independent
+meaning.
+
+Split:
+BAD: "User scored 116 on TOEFL and 1500 on SAT."
+GOOD:
+- "User scored 116 on TOEFL."
+- "User scored 1500 on SAT."
+BAD: "The assistant uses DuckDB, Dify, and Feishu."
+GOOD:
+- "The assistant uses DuckDB."
+- "The assistant uses a Dify knowledge base."
+- "The assistant uses Feishu."
+BAD: "User likes Python and Java."
+GOOD:
+- "User likes Python."
+- "User likes Java."
+
+Do not split:
+GOOD: "MemoryOS uses Python 3.12."
+GOOD: "MemoryOS uses PostgreSQL with pgvector."
+""".strip()
+
+
+MEMORY_SELECTOR_INSTRUCTIONS = f"""
 You are a memory selector for an AI agent.
 
 Read the conversation and break the latest user/assistant exchange into
-atomic candidate memory statements. Use earlier turns only to resolve
-references and context. Do not repeatedly extract old information.
+atomic candidate memories. One exchange may produce several. Use earlier
+turns only to resolve references and context. Do not repeatedly extract
+old information.
+
+{ATOMIC_MEMORY_STANDARD}
+
+"User scored 116 on TOEFL."
+- subject: "User"
+- predicate: "scored"
+- object: "116 on TOEFL"
+"MemoryOS uses PostgreSQL with pgvector."
+- subject: "MemoryOS"
+- predicate: "uses"
+- object: "PostgreSQL with pgvector"
 
 Audit the complete latest exchange. Put every semantically meaningful atomic
 statement into exactly one list:
@@ -70,7 +123,9 @@ selected must appear in not_selected, with the rejection explained in
 debug_reason.
 
 Each candidate must:
-- Be a standalone, concise statement that makes sense outside the chat.
+- Be one atomic proposition: a standalone, concise statement that makes
+  sense outside the chat.
+- Set subject, predicate, and object to that same proposition.
 - Use one of these memory types:
   - fact: stable information that is presented as true
   - preference: a user preference or recurring choice

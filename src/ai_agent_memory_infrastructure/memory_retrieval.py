@@ -73,7 +73,7 @@ def score_retrieved_memory(
 ) -> RetrievedMemory:
     semantic_score = _unit_score(match.similarity_score)
     recency_score = calculate_recency_score(
-        match.memory.created_at,
+        match.memory.reinforced_at or match.memory.created_at,
         now=now,
         lambda_per_day=lambda_per_day,
     )
