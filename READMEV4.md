@@ -15,7 +15,8 @@ The project uses Python 3.13 and is managed with
 - Main chat model: `gpt-4o-mini`
 - Memory selector: `gpt-5.6-luna`
 - Atomic checker: `gpt-5-mini`
-- Candidate relation classifier: `gpt-5-mini`
+- Atomic rewriter: `gpt-5.6-luna`
+- Candidate relation classifier: `gpt-5.6-luna`
 - Memory reranker: `gpt-5-nano`
 - Relation classifier: `gpt-5-mini`
 - Memory compressor: `gpt-5-mini`
@@ -35,8 +36,9 @@ The project uses Python 3.13 and is managed with
    MEMORY_RERANKER_MODEL=gpt-5-nano
    MEMORY_COMPRESSOR_MODEL=gpt-5-mini
    MEMORY_RELATION_MODEL=gpt-5-mini
-   MEMORY_CANDIDATE_RELATION_MODEL=gpt-5-mini
+   MEMORY_CANDIDATE_RELATION_MODEL=gpt-5.6-luna
    MEMORY_ATOMIC_CHECKER_MODEL=gpt-5-mini
+   MEMORY_ATOMIC_REWRITER_MODEL=gpt-5.6-luna
    MEMORY_DEDUP_MODEL=gpt-5-mini
    OPENAI_EMBEDDING_MODEL=text-embedding-3-small
    DATABASE_URL=postgresql://localhost:5432/agent_memory
@@ -85,6 +87,7 @@ Write path, inside `memory_add()`:
 - `extract_memory()`: calls GPT-5.6 Luna and returns selected and not-selected candidates
 - `score_atomic_memory()`: uses spaCy to score how atomic a candidate is
 - `check()`: asks GPT-5 Mini whether a high-scoring candidate is `valid` or `invalid`
+- `rewrite()`: asks GPT-5.6 Luna to split an invalid candidate into one or more atomic memories
 - `memory_search()` on the store: finds related stored memories by cosine similarity
 - `classify()` on the candidate relation classifier: labels a candidate against those related memories
 - `write_memory()`: validates, embeds, and inserts one approved record
@@ -152,12 +155,13 @@ The current Write Path contains:
 7. A selected or not-selected decision.
 8. A spaCy atomic score for every candidate.
 9. A GPT-5 Mini atomic check when a selected score is at or above `0.20`.
-10. Vector search for related Active and Conflicted memories, including expired ones.
-11. A GPT-5 Mini relation label when related memories are found.
-12. A fixed rule that stores, links, or discards the candidate.
-13. Runtime-generated IDs, timestamps, session data, status, and metadata.
-14. Content embedding with `text-embedding-3-small`.
-15. Persistent storage in PostgreSQL.
+10. A GPT-5.6 Luna rewrite when that check is invalid, then the same score and check for each replacement.
+11. Vector search for related Active and Conflicted memories, including expired ones.
+12. A GPT-5.6 Luna relation label when related memories are found.
+13. A fixed rule that stores, links, or discards the candidate.
+14. Runtime-generated IDs, timestamps, session data, status, and metadata.
+15. Content embedding with `text-embedding-3-small`.
+16. Persistent storage in PostgreSQL.
 
 ### Read Path
 
@@ -219,12 +223,18 @@ flowchart TD
     G --> H{Score at or above 0.20?}
     H -->|Yes| I[Atomic checker with GPT-5 Mini]
     I --> J{Valid?}
-    J -->|Invalid| K[Discard]
-    J -->|Valid| L[Search related memories]
+    J -->|Invalid| W[Rewrite once with GPT-5.6 Luna]
+    W --> X[Score each replacement with spaCy]
+    X --> Y{Score at or above 0.20?}
+    Y -->|Yes| Z[Atomic checker with GPT-5 Mini]
+    Z -->|Invalid| K[Discard]
+    Z -->|Valid| L[Search related memories]
+    Y -->|No| L
+    J -->|Valid| L
     H -->|No| L
     L --> M{Related memories above 0.60, top 5?}
     M -->|No| N[Store as Active]
-    M -->|Yes| O[Classify relation with GPT-5 Mini]
+    M -->|Yes| O[Classify relation with GPT-5.6 Luna]
     O --> P{Relation}
     P -->|Equivalent| Q[Discard and keep the old memory Active]
     P -->|Refinement| R[Store Active, supersede old, link REFINES]
@@ -297,8 +307,11 @@ sentence. A version, a qualifier, or an extension that belongs to one fact
 stays with that fact. Examples the selector is given:
 
 - Split `User likes Python and Java.` into one memory for Python and one for Java.
+- Split a résumé bullet that joins peers with `and`, such as Python, NumPy, and scikit-learn, SQL and Superset, dashboards and metrics, environmental and remote-sensing data, data mining and machine learning, or translation and interpretation.
 - Keep `MemoryOS uses Python 3.12.` as one memory.
 - Keep `MemoryOS uses PostgreSQL with pgvector.` as one memory.
+- Keep the school, employer, place, time, or purpose on the fact. `The user is majoring in Economics at New York University.` stays whole. When peers are split, that qualifier is copied onto each memory.
+- Subject, predicate, and object cannot hold a second peer.
 
 ### Atomic Score
 
@@ -322,8 +335,17 @@ less atomic. A single short proposition scores 0.
 A selected memory below `0.20` continues to the related-memory search. A
 score of `0.20` or higher is sent to the atomic checker. That checker uses
 the same atomic standard as the selector and returns `valid` or `invalid`.
-`invalid` discards the candidate. `valid` continues. The checker does not
-rewrite or split the text.
+`valid` continues. The checker does not rewrite or split the text.
+
+`invalid` is not stored. GPT-5.6 Luna receives that one candidate and
+returns one or more replacements. Each replacement uses only facts already
+in the invalid text. Type, importance, confidence, role, and the source
+quote are copied from the original candidate. Each replacement is scored
+with spaCy and, when its score is at or above `0.20`, checked again. A
+replacement that is still invalid is discarded. The rewrite runs once. A
+replacement that repeats the original sentence is discarded. A valid
+replacement, or one below the threshold, continues to the related-memory
+search.
 
 ### Related Memories
 
@@ -334,7 +356,7 @@ and Corrected memories stay in the database and are left out of this search.
 The search keeps at most 5 memories whose cosine similarity is strictly
 greater than `0.60`. If none qualify, the candidate is stored as Active.
 
-If any qualify, GPT-5 Mini returns one label for the candidate. When the
+If any qualify, GPT-5.6 Luna returns one label for the candidate. When the
 related memories do not all share one relation, the label follows the
 closest memory. Python then applies a fixed rule to every memory in that
 related set:
@@ -447,8 +469,8 @@ The link relation is one of `REFINES`, `SUPERSEDES`, `CORRECTS`, or `CONFLICTS`.
 
 IDs, timestamps, source, session ID, and exchange ID are generated by Python.
 `debug_source_quote` and selector confidence are LLM-generated diagnostic
-metadata. Rejected candidates, invalid atomic candidates, and equivalent
-duplicates are not persisted.
+metadata. Rejected candidates, atomic candidates that stay invalid after
+one rewrite, and equivalent duplicates are not persisted.
 
 Retrieval scores, duplicate clusters, compressed wording, and the atomic score are not part of this record. They are calculated when a memory is read or written and then discarded with the debug session.
 Read-path deduplication and compression never rewrite stored PostgreSQL
@@ -781,11 +803,11 @@ restart for a parameter change.
 - PostgreSQL memory is shared across sessions.
 - `Clear Saved Memories` deletes all persisted memories, links, and `memory_bin` rows.
 - `Parameter Configuration` opens the number controls in the same browser tab.
-- The side control offers `Off`, `Show Memory Debug`, or `Show Retrieval Inspector`. Only one panel is open.
+- The side control offers `Off`, `Show Memory Debug`, `Show Retrieval Inspector`, or `Show Maintenance Run`. Only one panel is open.
 
 `Show Memory Debug` has two pages:
 
-- `Breakdown` keeps the existing tabs: retrieved memories from the final context, candidates selected for storage, and candidates the selector rejected. Retrieved cards show Final, Retrieval, Semantic, Recency, and Importance. Selected and rejected cards show subject, predicate, object, and the atomic score. A checked memory also shows Valid or Invalid. A stored or discarded candidate shows its status, relation, and any link.
+- `Breakdown` keeps the existing tabs: retrieved memories from the final context, candidates selected for storage, and candidates the selector rejected. Retrieved cards show Final, Retrieval, Semantic, Recency, and Importance. Selected and rejected cards show subject, predicate, object, and the atomic score. A checked memory also shows Valid or Invalid. An invalid memory that was rewritten lists the replacements. A stored or discarded candidate shows its status, relation, and any link.
 - `Context` shows the full prompt sent to the main model, including instructions and input.
 
 `Show Retrieval Inspector` has three pages:
@@ -793,6 +815,11 @@ restart for a parameter change.
 - `Score` lists retrieval candidates in a table ordered by combined score. Columns are Memory, Combined, Semantic, Recency, Importance, Rerank, and Tokens. Rows selected after reranking and before deduplication are highlighted. The Tokens column counts only those rows.
 - `Context` shows one summary line: `Memories Used`, `Memory Tokens`, `Compression`, and `Dedup`.
 - `Dedup` lists every cluster above the duplicate threshold, the Equivalent or Contradictory label, and, for an equivalent cluster, the text that was kept.
+
+`Show Maintenance Run` keeps each maintenance pass from this browser session, newest first. A pass started by the sidebar button is labeled `Manual`. A pass started because stored tokens exceeded capacity is labeled `Token Capacity`.
+
+- `Dedup` lists each duplicate group, the Equivalent or Not Equivalent label, and every member. A member shows whether it was kept, moved to `memory_bin`, or left unchanged, plus its status, expired tag, content, keep score, and importance.
+- `Forget` lists each memory tagged expired by that pass, with the status that stayed in place and its content.
 
 The runtime searches across all sessions. Session IDs are stored on each
 memory but are not currently used as retrieval filters.
@@ -817,7 +844,8 @@ uv run python -m unittest discover -s tests -v
 ```
 
 The tests cover memory lifecycle operations, selector filtering, runtime
-writing, atomic scoring, the atomic checker threshold, related-memory search,
+writing, atomic scoring, the atomic checker threshold, atomic rewrite,
+related-memory search,
 status and link rules, weighted retrieval, the top-10 to top-4 rerank cut,
 duplicate clustering, equivalent keep-best and contradictory keep-both,
 compression after deduplication, context ordering, prompt formatting,
@@ -827,7 +855,8 @@ compatibility.
 ## Current Limitations
 
 - One selector-model call is made after each successful response.
-- One atomic-checker call is made for each selected memory at or above the atomic score threshold.
+- One atomic-checker call is made for each selected memory at or above the atomic score threshold, and again for a rewrite that is still at or above that threshold.
+- One atomic-rewriter call is made for each selected memory the checker marks invalid. A second invalid result is discarded.
 - One candidate-relation call is made when a selected memory has related stored memories.
 - The atomic score can flag a sentence that is still one proposition, and the checker can still accept or reject it incorrectly.
 - The candidate relation classifier returns one label for the related set.

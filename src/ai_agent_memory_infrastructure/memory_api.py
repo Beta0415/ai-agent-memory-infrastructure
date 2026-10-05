@@ -11,6 +11,10 @@ from ai_agent_memory_infrastructure.memory_atomic_checker import (
     ATOMIC_CHECK_VERDICTS,
     MemoryAtomicChecker,
 )
+from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
+    AtomicRewritePiece,
+    MemoryAtomicRewriter,
+)
 from ai_agent_memory_infrastructure.memory_atomic_score import (
     ATOMIC_SCORE_REVIEW_THRESHOLD,
     AtomicScore,
@@ -192,6 +196,8 @@ class CandidateMemoryDecision:
     links: tuple[MemoryLink, ...] = ()
     atomic_score: AtomicScore | None = None
     atomic_verdict: str | None = None
+    rewritten: tuple[str, ...] = ()
+    from_rewrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +266,34 @@ class MemoryAPI(Protocol):
     def memory_total_tokens(self) -> int: ...
 
 
+def _proposition_key(content: str) -> str:
+    return " ".join(content.split()).casefold()
+
+
+def _candidate_from_rewrite(
+    candidate: MemoryCandidate,
+    piece: AtomicRewritePiece,
+) -> MemoryCandidate | None:
+    content = piece.content.strip()
+    subject = piece.subject.strip()
+    predicate = piece.predicate.strip()
+    relation_object = piece.object.strip()
+    if not all((content, subject, predicate, relation_object)):
+        return None
+    return MemoryCandidate(
+        content=content,
+        subject=subject,
+        predicate=predicate,
+        object=relation_object,
+        type=candidate.type,
+        importance=candidate.importance,
+        confidence=candidate.confidence,
+        role=candidate.role,
+        debug_source_quote=candidate.debug_source_quote,
+        debug_reason=candidate.debug_reason,
+    )
+
+
 def _with_current_statuses(
     filters: MemoryFilters | None,
 ) -> MemoryFilters:
@@ -285,6 +319,7 @@ class AgentMemory:
             MemoryCandidateRelationClassifier | None
         ) = None,
         atomic_checker: MemoryAtomicChecker | None = None,
+        atomic_rewriter: MemoryAtomicRewriter | None = None,
         dedup_classifier: MemoryDedupClassifier | None = None,
     ) -> None:
         self._store = store
@@ -296,6 +331,7 @@ class AgentMemory:
             candidate_relation_classifier
         )
         self._atomic_checker = atomic_checker
+        self._atomic_rewriter = atomic_rewriter
         self._dedup_classifier = dedup_classifier
         self._source = source
         self._session_id = session_id
@@ -314,63 +350,14 @@ class AgentMemory:
         decisions: list[CandidateMemoryDecision] = []
 
         for candidate in selection.selected:
-            atomic_score = score_atomic_memory(
-                candidate.content,
-                weights=weights,
-            )
-            if needs_atomic_review(
-                atomic_score.score,
-                active.atomic_score_threshold,
-            ):
-                verdict = self._check_atomic_candidate(candidate)
-                if verdict == "invalid":
-                    decisions.append(
-                        CandidateMemoryDecision(
-                            candidate=candidate,
-                            related=(),
-                            relation=None,
-                            stored=None,
-                            atomic_score=atomic_score,
-                            atomic_verdict=verdict,
-                        )
-                    )
-                    continue
-            else:
-                verdict = None
-            related = self._related_memories(candidate.content, active)
-            if not related:
-                stored = self._write_candidate(candidate, exchange_id)
-                stored_memories.append(stored)
-                decisions.append(
-                    CandidateMemoryDecision(
-                        candidate=candidate,
-                        related=(),
-                        relation=None,
-                        stored=stored,
-                        atomic_score=atomic_score,
-                        atomic_verdict=verdict,
-                    )
-                )
-                continue
-            relation = self._classify_candidate(candidate.content, related)
-            stored, links = self._apply_candidate_relation(
+            self._process_selected_candidate(
                 candidate,
-                related,
-                relation,
-                exchange_id,
-            )
-            if stored is not None:
-                stored_memories.append(stored)
-            decisions.append(
-                CandidateMemoryDecision(
-                    candidate=candidate,
-                    related=tuple(related),
-                    relation=relation,
-                    stored=stored,
-                    links=links,
-                    atomic_score=atomic_score,
-                    atomic_verdict=verdict,
-                )
+                active=active,
+                weights=weights,
+                exchange_id=exchange_id,
+                stored_memories=stored_memories,
+                decisions=decisions,
+                allow_rewrite=True,
             )
 
         return MemoryAddResult(
@@ -382,6 +369,138 @@ class AgentMemory:
                 for candidate in selection.not_selected
             ),
         )
+
+    def _process_selected_candidate(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        active: WritePathSettings,
+        weights: AtomicScoreWeights,
+        exchange_id: str,
+        stored_memories: list[Memory],
+        decisions: list[CandidateMemoryDecision],
+        allow_rewrite: bool,
+    ) -> None:
+        atomic_score = score_atomic_memory(
+            candidate.content,
+            weights=weights,
+        )
+        verdict = None
+        if needs_atomic_review(
+            atomic_score.score,
+            active.atomic_score_threshold,
+        ):
+            verdict = self._check_atomic_candidate(candidate)
+            if verdict == "invalid":
+                self._reject_or_rewrite_candidate(
+                    candidate,
+                    atomic_score=atomic_score,
+                    active=active,
+                    weights=weights,
+                    exchange_id=exchange_id,
+                    stored_memories=stored_memories,
+                    decisions=decisions,
+                    allow_rewrite=allow_rewrite,
+                )
+                return
+        related = self._related_memories(candidate.content, active)
+        if not related:
+            stored = self._write_candidate(candidate, exchange_id)
+            stored_memories.append(stored)
+            decisions.append(
+                CandidateMemoryDecision(
+                    candidate=candidate,
+                    related=(),
+                    relation=None,
+                    stored=stored,
+                    atomic_score=atomic_score,
+                    atomic_verdict=verdict,
+                    from_rewrite=not allow_rewrite,
+                )
+            )
+            return
+        relation = self._classify_candidate(candidate.content, related)
+        stored, links = self._apply_candidate_relation(
+            candidate,
+            related,
+            relation,
+            exchange_id,
+        )
+        if stored is not None:
+            stored_memories.append(stored)
+        decisions.append(
+            CandidateMemoryDecision(
+                candidate=candidate,
+                related=tuple(related),
+                relation=relation,
+                stored=stored,
+                links=links,
+                atomic_score=atomic_score,
+                atomic_verdict=verdict,
+                from_rewrite=not allow_rewrite,
+            )
+        )
+
+    def _reject_or_rewrite_candidate(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        atomic_score: AtomicScore,
+        active: WritePathSettings,
+        weights: AtomicScoreWeights,
+        exchange_id: str,
+        stored_memories: list[Memory],
+        decisions: list[CandidateMemoryDecision],
+        allow_rewrite: bool,
+    ) -> None:
+        replacements: tuple[MemoryCandidate, ...] = ()
+        if allow_rewrite:
+            replacements = self._rewrite_atomic_candidate(candidate)
+        decisions.append(
+            CandidateMemoryDecision(
+                candidate=candidate,
+                related=(),
+                relation=None,
+                stored=None,
+                atomic_score=atomic_score,
+                atomic_verdict="invalid",
+                rewritten=tuple(
+                    replacement.content for replacement in replacements
+                ),
+            )
+        )
+        for replacement in replacements:
+            self._process_selected_candidate(
+                replacement,
+                active=active,
+                weights=weights,
+                exchange_id=exchange_id,
+                stored_memories=stored_memories,
+                decisions=decisions,
+                allow_rewrite=False,
+            )
+
+    def _rewrite_atomic_candidate(
+        self,
+        candidate: MemoryCandidate,
+    ) -> tuple[MemoryCandidate, ...]:
+        if self._atomic_rewriter is None:
+            raise RuntimeError(
+                "An invalid atomic memory needs an atomic rewriter."
+            )
+        pieces = self._atomic_rewriter.rewrite(candidate)
+        replacements: list[MemoryCandidate] = []
+        seen = {_proposition_key(candidate.content)}
+        for piece in pieces:
+            replacement = _candidate_from_rewrite(candidate, piece)
+            if replacement is None:
+                continue
+            key = _proposition_key(replacement.content)
+            if key in seen:
+                continue
+            seen.add(key)
+            replacements.append(replacement)
+        return tuple(replacements)
 
     def _check_atomic_candidate(self, candidate: MemoryCandidate) -> str:
         if self._atomic_checker is None:

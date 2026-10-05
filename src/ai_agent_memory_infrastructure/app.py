@@ -18,10 +18,14 @@ from ai_agent_memory_infrastructure.memory_dedup import (
 )
 from ai_agent_memory_infrastructure.memory_context import DuplicateCluster
 from ai_agent_memory_infrastructure.memory_maintenance import (
+    MaintenanceResult,
     MaintenanceSettings,
 )
 from ai_agent_memory_infrastructure.memory_atomic_checker import (
     OpenAIMemoryAtomicChecker,
+)
+from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
+    OpenAIMemoryAtomicRewriter,
 )
 from ai_agent_memory_infrastructure.memory_candidate_relation import (
     CANDIDATE_RELATION_EFFECTS,
@@ -117,6 +121,14 @@ def get_memory_atomic_checker(model: str) -> OpenAIMemoryAtomicChecker:
 
 
 @st.cache_resource
+def get_memory_atomic_rewriter(model: str) -> OpenAIMemoryAtomicRewriter:
+    return OpenAIMemoryAtomicRewriter(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
 def get_memory_candidate_relation_classifier(
     model: str,
 ) -> OpenAIMemoryCandidateRelationClassifier:
@@ -184,6 +196,8 @@ def _selected_debug_record(candidate, decision) -> dict[str, object]:
         ],
         **_atomic_score_fields(decision.atomic_score),
         "atomic_verdict": decision.atomic_verdict,
+        "rewritten": list(decision.rewritten),
+        "from_rewrite": decision.from_rewrite,
     }
 
 
@@ -329,12 +343,22 @@ def render_debug_cards(
                 st.caption("Atomic Check: Valid")
             elif verdict == "invalid":
                 st.caption("Atomic Check: Invalid")
+            rewritten = record.get("rewritten")
+            rewritten_lines = (
+                rewritten if isinstance(rewritten, list) else []
+            )
+            if record.get("from_rewrite") is True:
+                st.caption("From Rewrite")
             if isinstance(relation, str) and relation:
                 st.caption(
                     "Relation: "
                     f"{_candidate_relation_label(relation)}"
                 )
-            if relation == "equivalent" or verdict == "invalid":
+            if rewritten_lines:
+                st.caption("Write: Rewritten")
+                for line in rewritten_lines:
+                    st.caption(str(line))
+            elif relation == "equivalent" or verdict == "invalid":
                 st.caption("Write: Discarded")
             else:
                 status = record.get("status")
@@ -482,6 +506,145 @@ def _score_text(value: object) -> str:
     if value is None:
         return "—"
     return f"{float(value):.3f}"
+
+
+def record_maintenance_run(
+    result: MaintenanceResult,
+    trigger: str,
+) -> None:
+    runs = st.session_state.setdefault("maintenance_runs", [])
+    if not isinstance(runs, list):
+        runs = []
+        st.session_state.maintenance_runs = runs
+    runs.append(
+        {
+            "trigger": trigger,
+            "expired_count": result.expired_count,
+            "removed_count": result.removed_count,
+            "groups": [
+                {
+                    "verdict": group.verdict,
+                    "members": [
+                        {
+                            "content": member.content,
+                            "status": member.status,
+                            "expired": member.expired,
+                            "importance": member.importance,
+                            "keep_score": member.keep_score,
+                            "action": member.action,
+                        }
+                        for member in group.members
+                    ],
+                }
+                for group in result.groups
+            ],
+            "expired": [
+                {
+                    "content": memory.content,
+                    "status": memory.status,
+                }
+                for memory in result.expired_memories
+            ],
+        }
+    )
+
+
+def render_maintenance_panel() -> None:
+    st.subheader("Maintenance Run")
+    runs = st.session_state.get("maintenance_runs", [])
+    if not isinstance(runs, list) or not runs:
+        st.info("No Maintenance Run Yet")
+        return
+
+    page = st.radio(
+        "Maintenance Page",
+        ["Dedup", "Forget"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    for index, run in enumerate(reversed(runs)):
+        if not isinstance(run, dict):
+            continue
+        number = len(runs) - index
+        heading = f"Run {number}"
+        if index == 0:
+            heading += " · Latest"
+        with st.expander(heading, expanded=index == 0):
+            st.caption(str(run.get("trigger", "")))
+            st.caption(
+                f"Expired {int(run.get('expired_count', 0))} Memories · "
+                f"Removed {int(run.get('removed_count', 0))} Duplicates"
+            )
+            if page == "Dedup":
+                _render_maintenance_groups(run.get("groups", []))
+            else:
+                _render_maintenance_expired(run.get("expired", []))
+
+
+def _render_maintenance_groups(groups: object) -> None:
+    if not isinstance(groups, list) or not groups:
+        st.caption("No Duplicate Groups")
+        return
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, dict):
+            continue
+        verdict = str(group.get("verdict", ""))
+        label = (
+            "Equivalent" if verdict == "equivalent" else "Not Equivalent"
+        )
+        st.markdown(f"**Group {index} · {label}**")
+        members = group.get("members", [])
+        if not isinstance(members, list):
+            continue
+        for member_index, member in enumerate(members, start=1):
+            if not isinstance(member, dict):
+                continue
+            _render_maintenance_member(member_index, member)
+        if index < len(groups):
+            st.divider()
+
+
+def _render_maintenance_member(
+    index: int,
+    member: dict[str, object],
+) -> None:
+    action = _maintenance_action_label(str(member.get("action", "")))
+    status = _memory_status_label(str(member.get("status", "")))
+    st.markdown(f"**{index}. {action}** · {status}")
+    if member.get("expired") is True and member.get("action") == "kept":
+        st.caption("Expired · Cleared By This Run")
+    elif member.get("expired") is True:
+        st.caption("Expired")
+    else:
+        st.caption("Not Expired")
+    st.write(str(member.get("content", "")))
+    st.caption(
+        f"Keep Score {float(member.get('keep_score', 0.0)):.3f} · "
+        f"Importance {float(member.get('importance', 0.0)):.2f}"
+    )
+
+
+def _render_maintenance_expired(expired: object) -> None:
+    if not isinstance(expired, list) or not expired:
+        st.caption("No Memories Were Expired")
+        return
+    for index, memory in enumerate(expired, start=1):
+        if not isinstance(memory, dict):
+            continue
+        status = _memory_status_label(str(memory.get("status", "")))
+        st.markdown(f"**{index}. Expired** · {status}")
+        st.write(str(memory.get("content", "")))
+        if index < len(expired):
+            st.divider()
+
+
+def _maintenance_action_label(action: str) -> str:
+    labels = {
+        "kept": "Kept",
+        "removed": "Moved To Bin",
+        "unchanged": "Left Unchanged",
+    }
+    return labels.get(action, action)
 
 
 def render_retrieval_inspector(
@@ -802,12 +965,8 @@ def generate_assistant_turn(
                 maintenance_settings=current_maintenance_settings(),
             )
             memory_write_debug["selected"] = [
-                _selected_debug_record(candidate, decision)
-                for candidate, decision in zip(
-                    write_result.selection.selected,
-                    write_result.decisions,
-                    strict=True,
-                )
+                _selected_debug_record(decision.candidate, decision)
+                for decision in write_result.decisions
             ]
             memory_write_debug["not_selected"] = [
                 {
@@ -824,6 +983,11 @@ def generate_assistant_turn(
             memory_write_debug["stored_count"] = len(
                 write_result.stored_memories
             )
+            if memory_runtime.last_maintenance is not None:
+                record_maintenance_run(
+                    memory_runtime.last_maintenance,
+                    "Token Capacity",
+                )
         except Exception as exc:
             memory_write_debug["error"] = str(exc)
             st.warning(
@@ -855,10 +1019,13 @@ memory_relation_model = os.getenv(
     "MEMORY_RELATION_MODEL", "gpt-5-mini"
 )
 memory_candidate_relation_model = os.getenv(
-    "MEMORY_CANDIDATE_RELATION_MODEL", "gpt-5-mini"
+    "MEMORY_CANDIDATE_RELATION_MODEL", "gpt-5.6-luna"
 )
 memory_atomic_checker_model = os.getenv(
     "MEMORY_ATOMIC_CHECKER_MODEL", "gpt-5-mini"
+)
+memory_atomic_rewriter_model = os.getenv(
+    "MEMORY_ATOMIC_REWRITER_MODEL", "gpt-5.6-luna"
 )
 memory_dedup_model = os.getenv(
     "MEMORY_DEDUP_MODEL", "gpt-5-mini"
@@ -871,6 +1038,7 @@ memory_compressor = None
 memory_relation_classifier = None
 memory_candidate_relation_classifier = None
 memory_atomic_checker = None
+memory_atomic_rewriter = None
 memory_dedup_classifier = None
 memory_error = None
 if api_key:
@@ -889,6 +1057,9 @@ if api_key:
         )
         memory_atomic_checker = get_memory_atomic_checker(
             memory_atomic_checker_model
+        )
+        memory_atomic_rewriter = get_memory_atomic_rewriter(
+            memory_atomic_rewriter_model
         )
         memory_dedup_classifier = get_memory_dedup_classifier(
             memory_dedup_model
@@ -909,6 +1080,8 @@ if "write_path_settings" not in st.session_state:
     st.session_state.write_path_settings = WritePathSettings()
 if "maintenance_settings" not in st.session_state:
     st.session_state.maintenance_settings = MaintenanceSettings()
+if "maintenance_runs" not in st.session_state:
+    st.session_state.maintenance_runs = []
 
 memory_api = (
     AgentMemory(
@@ -923,6 +1096,7 @@ memory_api = (
             memory_candidate_relation_classifier
         ),
         atomic_checker=memory_atomic_checker,
+        atomic_rewriter=memory_atomic_rewriter,
         dedup_classifier=memory_dedup_classifier,
     )
     if (
@@ -933,6 +1107,7 @@ memory_api = (
         and memory_relation_classifier
         and memory_candidate_relation_classifier
         and memory_atomic_checker
+        and memory_atomic_rewriter
         and memory_dedup_classifier
     )
     else None
@@ -949,7 +1124,12 @@ with st.sidebar:
         st.switch_page("pages/parameter_configuration.py")
     side_panel = st.radio(
         "Side Panel",
-        ["Off", "Show Memory Debug", "Show Retrieval Inspector"],
+        [
+            "Off",
+            "Show Memory Debug",
+            "Show Retrieval Inspector",
+            "Show Maintenance Run",
+        ],
         label_visibility="collapsed",
     )
     if st.button("Clear Conversation", use_container_width=True):
@@ -969,6 +1149,7 @@ with st.sidebar:
             maintained = memory_runtime.runtime_run_maintenance(
                 maintenance_settings=current_maintenance_settings(),
             )
+            record_maintenance_run(maintained, "Manual")
             st.session_state.maintenance_message = (
                 f"Expired {maintained.expired_count} Memories · "
                 f"Removed {maintained.removed_count} Duplicates"
@@ -1009,6 +1190,8 @@ if side_column:
             render_memory_debug_panel(st.session_state.messages)
         elif side_panel == "Show Retrieval Inspector":
             render_retrieval_inspector(st.session_state.messages)
+        elif side_panel == "Show Maintenance Run":
+            render_maintenance_panel()
 
 prompt = st.chat_input("Send A Message", disabled=not api_key)
 if prompt:

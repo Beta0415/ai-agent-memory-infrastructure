@@ -124,7 +124,7 @@ class OpenAIMemoryCandidateRelationClassifier:
         self,
         *,
         api_key: str,
-        model: str = "gpt-5-mini",
+        model: str = "gpt-5.6-luna",
     ) -> None:
         self._model = model
         self._openai = OpenAI(api_key=api_key)

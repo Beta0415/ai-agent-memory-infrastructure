@@ -12,6 +12,9 @@ from ai_agent_memory_infrastructure.memory_api import (
     ReadPathSettings,
     WritePathSettings,
 )
+from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
+    AtomicRewritePiece,
+)
 from ai_agent_memory_infrastructure.memory_atomic_score import (
     AtomicScoreWeights,
     component_score,
@@ -287,6 +290,23 @@ class MemoryAPITest(unittest.TestCase):
         )
         self.assertIsNotNone(self.store.memory_get("different"))
         self.assertEqual(classifier.calls[0][0], "newer-copy")
+        self.assertEqual(result.groups[0].verdict, "equivalent")
+        actions = {
+            member.memory_id: member.action
+            for member in result.groups[0].members
+        }
+        self.assertEqual(actions["newer-copy"], "kept")
+        self.assertEqual(actions["older-copy"], "removed")
+        removed = next(
+            member
+            for member in result.groups[0].members
+            if member.memory_id == "older-copy"
+        )
+        self.assertEqual(
+            removed.content,
+            "The user prefers concise answers.",
+        )
+        self.assertEqual(removed.status, "active")
 
     def test_maintenance_dedup_keeps_the_higher_importance_recency_score(self) -> None:
         now = datetime(2026, 8, 1, tzinfo=UTC)
@@ -346,6 +366,13 @@ class MemoryAPITest(unittest.TestCase):
         ).memory_maintain(now=datetime(2026, 8, 1, tzinfo=UTC))
 
         self.assertEqual(result.removed_count, 0)
+        self.assertEqual(result.groups[0].verdict, "not_equivalent")
+        self.assertTrue(
+            all(
+                member.action == "unchanged"
+                for member in result.groups[0].members
+            )
+        )
         self.assertIsNotNone(self.store.memory_get("left"))
         self.assertIsNotNone(self.store.memory_get("right"))
         self.assertEqual(self.store.bin_count(), 0)
@@ -440,6 +467,19 @@ class MemoryAPITest(unittest.TestCase):
         ).memory_maintain(now=now)
 
         self.assertEqual(expired.expired_count, 2)
+        expired_by_id = {
+            memory.memory_id: memory for memory in expired.expired_memories
+        }
+        self.assertEqual(
+            set(expired_by_id),
+            {"old-active", "old-superseded"},
+        )
+        self.assertEqual(expired_by_id["old-active"].status, "active")
+        self.assertEqual(
+            expired_by_id["old-superseded"].content,
+            "An old superseded memory.",
+        )
+        self.assertEqual(expired_by_id["old-superseded"].status, "superseded")
         old_active = self.store.memory_get("old-active")
         recent_active = self.store.memory_get("recent-active")
         old_accessed = self.store.memory_get("old-accessed")
@@ -891,13 +931,14 @@ class MemoryAPITest(unittest.TestCase):
             settings=settings,
         )
 
-    def _write_non_atomic_candidate(self, checker):
+    def _write_non_atomic_candidate(self, checker, rewriter=None):
         memory_api = AgentMemory(
             self.store,
             NonAtomicMemorySelector(),
             source="test",
             session_id="session-2",
             atomic_checker=checker,
+            atomic_rewriter=rewriter,
         )
         return memory_api.memory_add(_sample_exchange())
 
@@ -937,16 +978,92 @@ class MemoryAPITest(unittest.TestCase):
         self.assertIsNone(result.decisions[0].atomic_verdict)
         self.assertEqual(len(result.stored_memories), 1)
 
-    def test_invalid_atomic_memory_is_discarded(self) -> None:
+    def test_invalid_atomic_memory_is_rewritten_and_stored(self) -> None:
         checker = ScriptedAtomicChecker("invalid")
+        rewriter = ScriptedAtomicRewriter(
+            [
+                ("User likes Python.", "User", "likes", "Python"),
+                ("User likes Java.", "User", "likes", "Java"),
+            ]
+        )
 
-        result = self._write_non_atomic_candidate(checker)
+        result = self._write_non_atomic_candidate(checker, rewriter)
 
         self.assertEqual(checker.calls, ["User likes Python and Java."])
+        self.assertEqual(rewriter.calls, ["User likes Python and Java."])
         self.assertEqual(result.decisions[0].atomic_verdict, "invalid")
         self.assertIsNone(result.decisions[0].stored)
+        self.assertEqual(
+            result.decisions[0].rewritten,
+            ("User likes Python.", "User likes Java."),
+        )
+        self.assertEqual(len(result.stored_memories), 2)
+        self.assertEqual(
+            {memory.content for memory in result.stored_memories},
+            {"User likes Python.", "User likes Java."},
+        )
+        self.assertTrue(
+            all(decision.from_rewrite for decision in result.decisions[1:])
+        )
+        self.assertEqual(
+            result.decisions[1].candidate.importance,
+            0.8,
+        )
+        self.assertEqual(self.store.count(), 2)
+
+    def test_invalid_atomic_memory_requires_a_rewriter(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self._write_non_atomic_candidate(ScriptedAtomicChecker("invalid"))
+
+        self.assertEqual(self.store.count(), 0)
+
+    def test_rewrite_that_repeats_the_candidate_is_discarded(self) -> None:
+        rewriter = ScriptedAtomicRewriter(
+            [
+                (
+                    "User likes Python and Java.",
+                    "User",
+                    "likes",
+                    "Python and Java",
+                )
+            ]
+        )
+
+        result = self._write_non_atomic_candidate(
+            ScriptedAtomicChecker("invalid"),
+            rewriter,
+        )
+
+        self.assertEqual(result.decisions[0].rewritten, ())
         self.assertEqual(result.stored_memories, ())
-        self.assertGreaterEqual(result.decisions[0].atomic_score.score, 0.2)
+        self.assertEqual(self.store.count(), 0)
+
+    def test_a_second_invalid_rewrite_is_discarded(self) -> None:
+        checker = ScriptedAtomicChecker("invalid")
+        rewriter = ScriptedAtomicRewriter(
+            [
+                (
+                    "User likes Python and Java too.",
+                    "User",
+                    "likes",
+                    "Python and Java",
+                )
+            ]
+        )
+
+        result = self._write_non_atomic_candidate(checker, rewriter)
+
+        self.assertEqual(
+            checker.calls,
+            [
+                "User likes Python and Java.",
+                "User likes Python and Java too.",
+            ],
+        )
+        self.assertEqual(rewriter.calls, ["User likes Python and Java."])
+        self.assertEqual(result.decisions[1].atomic_verdict, "invalid")
+        self.assertEqual(result.decisions[1].rewritten, ())
+        self.assertEqual(result.stored_memories, ())
         self.assertEqual(self.store.count(), 0)
 
     def test_valid_atomic_memory_continues_to_storage(self) -> None:
@@ -1726,6 +1843,27 @@ class ScriptedDedupClassifier:
             (candidate.id, [memory.id for memory in related])
         )
         return self.verdict
+
+
+class ScriptedAtomicRewriter:
+    def __init__(
+        self,
+        memories: list[tuple[str, str, str, str]],
+    ) -> None:
+        self.memories = memories
+        self.calls: list[str] = []
+
+    def rewrite(self, candidate):
+        self.calls.append(candidate.content)
+        return [
+            AtomicRewritePiece(
+                content=content,
+                subject=subject,
+                predicate=predicate,
+                object=relation_object,
+            )
+            for content, subject, predicate, relation_object in self.memories
+        ]
 
 
 class ScriptedAtomicChecker:

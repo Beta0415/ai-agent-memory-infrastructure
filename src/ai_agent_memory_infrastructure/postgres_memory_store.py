@@ -584,7 +584,7 @@ class PostgresMemoryStore:
         *,
         now: datetime,
         inactivity_days: int,
-    ) -> int:
+    ) -> list[Memory]:
         if inactivity_days < 1:
             raise ValueError("Inactivity period must be at least 1 day.")
         cutoff = now - timedelta(days=inactivity_days)
@@ -600,12 +600,16 @@ class PostgresMemoryStore:
                     COALESCE(last_accessed_at, created_at),
                     COALESCE(reinforced_at, created_at)
                 ) < %s
+                RETURNING id, content, memory_type, role, source, session_id,
+                          importance, created_at, updated_at, metadata, status,
+                          token_count, last_accessed_at, reinforced_at, expired,
+                          subject, predicate, object
                 """,
                 (cutoff,),
             )
-            expired = cursor.rowcount
+            rows = cursor.fetchall()
         self._connection.commit()
-        return expired
+        return [_memory_from_row(row) for row in rows]
 
     def memory_ids(self, filters: MemoryFilters | None = None) -> list[str]:
         clauses, params = _filter_clauses(filters)

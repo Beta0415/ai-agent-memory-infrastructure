@@ -63,14 +63,18 @@ changing the rest, split it into separate memories.
 
 Subject, predicate, and object must restate that same proposition and
 nothing else. If the content needs a second subject, predicate, or object,
-it is not atomic.
+it is not atomic. A list of peers cannot be one object. If "and" joins two
+things that could be corrected separately, return one memory for each.
 
 Atomic does not mean the smallest possible sentence. Keep one proposition
-together, including the qualifiers that belong to it. Do not split a tool
-from the way it is used, a product from its version, or a database from
-its extension when those words state one fact. Do not repeat a proposition
-in different words, and do not register a fragment that has no independent
-meaning.
+together, including the qualifiers that belong to it. A qualifier is the
+school, employer, place, time, or purpose that says which fact this is.
+When peers are split, copy that shared qualifier onto every memory. Do not
+shorten a fact by dropping it. Do not split a tool from the way it is
+used, a product from its version, or a database from its extension when
+those words state one fact. An ampersand inside a proper name is part of
+that name. Do not repeat a proposition in different words, and do not
+register a fragment that has no independent meaning.
 
 Split:
 BAD: "User scored 116 on TOEFL and 1500 on SAT."
@@ -86,10 +90,42 @@ BAD: "User likes Python and Java."
 GOOD:
 - "User likes Python."
 - "User likes Java."
+BAD: "The user supported XGBoost credit risk model development using Python, NumPy, and scikit-learn."
+GOOD:
+- "The user supported XGBoost credit risk model development."
+- "The user used Python for XGBoost credit risk model development."
+- "The user used NumPy for XGBoost credit risk model development."
+- "The user used scikit-learn for XGBoost credit risk model development."
+BAD: "The user designed a SQL and Superset data pipeline for dashboards and metrics at WeBank."
+GOOD:
+- "The user designed a SQL data pipeline at WeBank."
+- "The user designed a Superset data pipeline at WeBank."
+- "The user designed a data pipeline for dashboards at WeBank."
+- "The user designed a data pipeline for metrics at WeBank."
+BAD: "The user analyzed Southern China forest productivity using environmental and remote-sensing data."
+GOOD:
+- "The user analyzed Southern China forest productivity using environmental data."
+- "The user analyzed Southern China forest productivity using remote-sensing data."
+BAD: "The user completed a summer course project on data mining and machine learning for business decision-making."
+GOOD:
+- "The user completed a summer course project on data mining for business decision-making."
+- "The user completed a summer course project on machine learning for business decision-making."
+BAD: "The user volunteered as a concert translator providing English-Chinese translation and interpretation."
+GOOD:
+- "The user volunteered as a concert translator providing English-Chinese translation."
+- "The user volunteered as a concert translator providing English-Chinese interpretation."
+BAD: "The user is majoring in Economics and Data Science at New York University."
+GOOD:
+- "The user is majoring in Economics at New York University."
+- "The user is majoring in Data Science at New York University."
 
-Do not split:
+Do not split, and do not shorten:
+BAD: "The user is majoring in Economics."
+GOOD: "The user is majoring in Economics at New York University."
 GOOD: "MemoryOS uses Python 3.12."
 GOOD: "MemoryOS uses PostgreSQL with pgvector."
+GOOD: "The user expects to graduate from New York University in May 2027."
+GOOD: "The user worked as a Data Analyst Intern in WeBank's International Business & Development Division."
 """.strip()
 
 

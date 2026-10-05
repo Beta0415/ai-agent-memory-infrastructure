@@ -38,6 +38,7 @@ class MemoryContext:
 class MemoryRuntime:
     def __init__(self, memory_api: MemoryAPI) -> None:
         self._memory_api = memory_api
+        self.last_maintenance: MaintenanceResult | None = None
 
     def runtime_build_memory_context(
         self,
@@ -75,10 +76,13 @@ class MemoryRuntime:
         settings: WritePathSettings | None = None,
         maintenance_settings: MaintenanceSettings | None = None,
     ) -> MemoryAddResult:
+        self.last_maintenance = None
         result = self._memory_api.memory_add(conversation, settings=settings)
         active_maintenance = maintenance_settings or MaintenanceSettings()
         if self._memory_api.memory_total_tokens() > active_maintenance.token_capacity:
-            self._memory_api.memory_maintain(settings=active_maintenance)
+            self.last_maintenance = self._memory_api.memory_maintain(
+                settings=active_maintenance,
+            )
         return result
 
     def runtime_run_maintenance(

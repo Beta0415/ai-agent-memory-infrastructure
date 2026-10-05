@@ -60,9 +60,35 @@ class MaintenanceSettings:
 
 
 @dataclass(frozen=True)
+class MaintenanceMember:
+    memory_id: str
+    content: str
+    status: str
+    expired: bool
+    importance: float
+    keep_score: float
+    action: str
+
+
+@dataclass(frozen=True)
+class MaintenanceGroup:
+    verdict: str
+    members: tuple[MaintenanceMember, ...]
+
+
+@dataclass(frozen=True)
+class MaintenanceExpired:
+    memory_id: str
+    content: str
+    status: str
+
+
+@dataclass(frozen=True)
 class MaintenanceResult:
     expired_count: int
     removed_count: int = 0
+    groups: tuple[MaintenanceGroup, ...] = ()
+    expired_memories: tuple[MaintenanceExpired, ...] = ()
 
 
 class MemoryMaintenance:
@@ -79,7 +105,7 @@ class MemoryMaintenance:
         *,
         now: datetime,
         inactivity_days: int = FORGET_INACTIVITY_DAYS,
-    ) -> int:
+    ) -> list[Memory]:
         return self._store.expire_inactive_memories(
             now=now,
             inactivity_days=inactivity_days,
@@ -90,15 +116,16 @@ class MemoryMaintenance:
         *,
         now: datetime,
         settings: MaintenanceSettings | None = None,
-    ) -> int:
+    ) -> tuple[int, tuple[MaintenanceGroup, ...]]:
         if self._dedup_classifier is None:
-            return 0
+            return 0, ()
         active = settings or MaintenanceSettings()
         groups = _duplicate_groups(
             self._store,
             active.similarity_threshold,
         )
         removed = 0
+        reports: list[MaintenanceGroup] = []
         for group in groups:
             keeper = max(
                 group,
@@ -112,16 +139,29 @@ class MemoryMaintenance:
                     "The dedup classifier returned an unknown verdict: "
                     f"{verdict}"
                 )
-            if label != "equivalent":
-                continue
-            self._store.reinforce_memories(
-                [keeper.id],
-                reinforced_at=now,
+            if label == "equivalent":
+                self._store.reinforce_memories(
+                    [keeper.id],
+                    reinforced_at=now,
+                )
+                for memory in others:
+                    self._store.move_memory_to_bin(memory.id)
+                    removed += 1
+            reports.append(
+                MaintenanceGroup(
+                    verdict=label,
+                    members=tuple(
+                        _member_report(
+                            memory,
+                            now,
+                            active,
+                            _member_action(label, memory.id, keeper.id),
+                        )
+                        for memory in (keeper, *others)
+                    ),
+                )
             )
-            for memory in others:
-                self._store.move_memory_to_bin(memory.id)
-                removed += 1
-        return removed
+        return removed, tuple(reports)
 
     def run(
         self,
@@ -129,14 +169,49 @@ class MemoryMaintenance:
         now: datetime,
         settings: MaintenanceSettings | None = None,
     ) -> MaintenanceResult:
-        removed_count = self.deduplicate(now=now, settings=settings)
+        removed_count, groups = self.deduplicate(now=now, settings=settings)
+        expired = self.forget(now=now)
         return MaintenanceResult(
-            expired_count=self.forget(now=now),
+            expired_count=len(expired),
             removed_count=removed_count,
+            groups=groups,
+            expired_memories=tuple(
+                MaintenanceExpired(
+                    memory_id=memory.id,
+                    content=memory.content,
+                    status=memory.status.value,
+                )
+                for memory in expired
+            ),
         )
 
     def over_capacity(self, token_capacity: int) -> bool:
         return self._store.total_token_count() > token_capacity
+
+
+def _member_action(verdict: str, memory_id: str, keeper_id: str) -> str:
+    if verdict != "equivalent":
+        return "unchanged"
+    if memory_id == keeper_id:
+        return "kept"
+    return "removed"
+
+
+def _member_report(
+    memory: Memory,
+    now: datetime,
+    settings: MaintenanceSettings,
+    action: str,
+) -> MaintenanceMember:
+    return MaintenanceMember(
+        memory_id=memory.id,
+        content=memory.content,
+        status=memory.status.value,
+        expired=memory.expired,
+        importance=memory.importance,
+        keep_score=_keep_key(memory, now, settings)[0],
+        action=action,
+    )
 
 
 def _keep_key(
