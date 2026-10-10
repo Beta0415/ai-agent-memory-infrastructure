@@ -15,6 +15,10 @@ from ai_agent_memory_infrastructure.memory_api import (
 from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
     AtomicRewritePiece,
 )
+from ai_agent_memory_infrastructure.memory_graph import (
+    GraphEdgeDraft,
+    memory_connections,
+)
 from ai_agent_memory_infrastructure.memory_atomic_score import (
     AtomicScoreWeights,
     component_score,
@@ -760,6 +764,47 @@ class MemoryAPITest(unittest.TestCase):
             MemoryStatus.SUPERSEDED,
         )
 
+    def test_each_related_memory_keeps_its_own_relation(self) -> None:
+        calculus = self.store.write_memory(
+            "The user prefers concise answers about calculus.",
+            memory_type=MemoryType.PREFERENCE,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        algebra = self.store.write_memory(
+            "The user prefers concise answers about algebra.",
+            memory_type=MemoryType.PREFERENCE,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        classifier = ScriptedCandidateRelationClassifier(
+            {
+                calculus.id: "refinement",
+                algebra.id: "related_distinct",
+            }
+        )
+
+        result = self._write_selected_candidate(classifier)
+
+        self.assertIsNone(result.decisions[0].relation)
+        self.assertEqual(
+            {link.to_memory_id for link in result.decisions[0].links},
+            {calculus.id},
+        )
+        self.assertEqual(
+            self.store.memory_get(calculus.id).status,
+            MemoryStatus.SUPERSEDED,
+        )
+        self.assertEqual(
+            self.store.memory_get(algebra.id).status,
+            MemoryStatus.ACTIVE,
+        )
+        stored = result.decisions[0].stored
+        assert stored is not None
+        self.assertEqual(stored.status, MemoryStatus.ACTIVE)
+
     def test_superseded_memory_stays_out_of_retrieval(self) -> None:
         existing = self.store.write_memory(
             "The user prefers concise answers.",
@@ -1088,6 +1133,170 @@ class MemoryAPITest(unittest.TestCase):
 
         self.assertEqual(self.store.count(), 0)
 
+    def test_graph_connects_memories_that_share_an_entity(self) -> None:
+        major = self.store.write_memory(
+            "The user is majoring in Economics at New York University.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        graduate = self.store.write_memory(
+            "The user expects to graduate from New York University in May 2027.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        self._import_dated(
+            "old-job",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            content="The user worked at a previous company.",
+            status=MemoryStatus.SUPERSEDED,
+        )
+        self._import_dated(
+            "quiet",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            content="The user lived in Boston.",
+            expired=True,
+        )
+        extractor = ScriptedGraphExtractor(
+            {
+                major.id: (
+                    ("The user", "majoring in", "Economics"),
+                    ("The user", "majoring at", "New York University"),
+                ),
+                graduate.id: (
+                    (
+                        "The user",
+                        "expects to graduate from",
+                        "New York University",
+                    ),
+                    ("The user", "expects to graduate in", "May 2027"),
+                ),
+                "old-job": (("The user", "worked at", "Previous Company"),),
+                "quiet": (("The user", "lived in", "Boston"),),
+            }
+        )
+
+        result = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+        ).memory_graph_build()
+
+        self.assertEqual(extractor.calls, [major.id, graduate.id])
+        self.assertEqual(result.built_count, 2)
+        self.assertEqual(result.entity_count, 4)
+        records = self.store.graph_edge_records()
+        self.assertEqual(
+            {
+                (record[0], record[2])
+                for record in records
+                if record[2] == "New York University"
+            },
+            {
+                ("The user", "New York University"),
+            },
+        )
+        self.assertEqual(
+            {record[3] for record in records},
+            {major.id, graduate.id},
+        )
+
+        again = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+        ).memory_graph_build()
+
+        self.assertEqual(again.built_count, 0)
+        self.assertEqual(extractor.calls, [major.id, graduate.id])
+
+    def test_graph_drops_edges_when_a_memory_is_no_longer_current(self) -> None:
+        kept = self.store.write_memory(
+            "The user is majoring in Economics at New York University.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        removed = self.store.write_memory(
+            "The user expects to graduate from New York University in May 2027.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        extractor = ScriptedGraphExtractor(
+            {
+                kept.id: (
+                    ("The user", "majoring at", "New York University"),
+                ),
+                removed.id: (
+                    (
+                        "The user",
+                        "expects to graduate from",
+                        "New York University",
+                    ),
+                ),
+            }
+        )
+        memory_api = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+        )
+        memory_api.memory_graph_build()
+        self.store.record_memory_link(
+            from_memory_id=kept.id,
+            to_memory_id=removed.id,
+            relation=MemoryLinkRelation.SUPERSEDES,
+            to_status=MemoryStatus.SUPERSEDED,
+        )
+
+        result = memory_api.memory_graph_build()
+
+        self.assertEqual(result.edge_count, 1)
+        self.assertEqual(
+            {record[3] for record in self.store.graph_edge_records()},
+            {kept.id},
+        )
+        self.assertEqual(result.entity_count, 2)
+
+    def test_memory_link_records_include_both_contents(self) -> None:
+        older = self.store.write_memory(
+            "The user likes Python.",
+            memory_type=MemoryType.PREFERENCE,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        newer = self.store.write_memory(
+            "The user likes Java now.",
+            memory_type=MemoryType.PREFERENCE,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        self.store.record_memory_link(
+            from_memory_id=newer.id,
+            to_memory_id=older.id,
+            relation=MemoryLinkRelation.SUPERSEDES,
+            to_status=MemoryStatus.SUPERSEDED,
+        )
+
+        self.assertEqual(
+            self.store.memory_link_records(),
+            [("SUPERSEDES", "The user likes Java now.", "The user likes Python.")],
+        )
+
     def test_related_limit_keeps_only_the_requested_count(self) -> None:
         self.store.write_memory(
             "The user prefers concise answers.",
@@ -1139,6 +1348,7 @@ class MemoryAPITest(unittest.TestCase):
         reinforced_at: datetime | None = None,
         embedding: list[float] | None = None,
         importance: float = 0.5,
+        expired: bool = False,
     ) -> None:
         self.store.import_record(
             memory_id=memory_id,
@@ -1155,6 +1365,7 @@ class MemoryAPITest(unittest.TestCase):
             status=status,
             last_accessed_at=last_accessed_at,
             reinforced_at=reinforced_at,
+            expired=expired,
         )
 
     def _import_vector(
@@ -1845,6 +2056,60 @@ class ScriptedDedupClassifier:
         return self.verdict
 
 
+class MemoryConnectionTest(unittest.TestCase):
+    def test_links_two_memories_that_share_an_entity(self) -> None:
+        view = memory_connections(
+            [
+                ("graduate", "Graduate from NYU.", "nyu", "New York University"),
+                ("gpa", "GPA at NYU.", "nyu", "New York University"),
+                ("graduate", "Graduate from NYU.", "user", "The user"),
+                ("gpa", "GPA at NYU.", "user", "The user"),
+                ("boston", "Lived in Boston.", "user", "The user"),
+            ],
+            broad_limit=2,
+        )
+
+        self.assertEqual(
+            view.links,
+            (("gpa", "graduate", ("New York University",)),),
+        )
+        self.assertEqual(
+            view.groups,
+            (
+                ("user", "The user", ("boston", "gpa", "graduate")),
+                ("nyu", "New York University", ("gpa", "graduate")),
+            ),
+        )
+        self.assertEqual(view.broad_entities, (("The user", 3),))
+        self.assertEqual(
+            view.hubs,
+            (("user", "The user", ("boston", "gpa", "graduate")),),
+        )
+
+
+class ScriptedGraphExtractor:
+    def __init__(
+        self,
+        edges_by_id: dict[str, tuple[tuple[str, str, str], ...]],
+    ) -> None:
+        self.edges_by_id = edges_by_id
+        self.calls: list[str] = []
+
+    def extract(self, memory):
+        self.calls.append(memory.id)
+        return [
+            GraphEdgeDraft(
+                from_entity=from_entity,
+                relation=relation,
+                to_entity=to_entity,
+            )
+            for from_entity, relation, to_entity in self.edges_by_id.get(
+                memory.id,
+                (),
+            )
+        ]
+
+
 class ScriptedAtomicRewriter:
     def __init__(
         self,
@@ -1877,7 +2142,7 @@ class ScriptedAtomicChecker:
 
 
 class ScriptedCandidateRelationClassifier:
-    def __init__(self, relation: str) -> None:
+    def __init__(self, relation: str | dict[str, str]) -> None:
         self.relation = relation
         self.calls: list[tuple[str, list[str]]] = []
 
@@ -1888,7 +2153,14 @@ class ScriptedCandidateRelationClassifier:
                 [match.memory.id for match in related],
             )
         )
-        return self.relation
+        if isinstance(self.relation, dict):
+            return [
+                (match.memory.id, self.relation[match.memory.id])
+                for match in related
+            ]
+        return [
+            (match.memory.id, self.relation) for match in related
+        ]
 
 
 class ScriptedRelationClassifier:

@@ -10,6 +10,7 @@ from ai_agent_memory_infrastructure.memory_api import (
     ReadPathSettings,
     WritePathSettings,
 )
+from ai_agent_memory_infrastructure.memory_graph import GraphBuildResult
 from ai_agent_memory_infrastructure.memory_maintenance import (
     MaintenanceResult,
     MaintenanceSettings,
@@ -39,6 +40,8 @@ class MemoryRuntime:
     def __init__(self, memory_api: MemoryAPI) -> None:
         self._memory_api = memory_api
         self.last_maintenance: MaintenanceResult | None = None
+        self.last_graph: GraphBuildResult | None = None
+        self.last_graph_error: str | None = None
 
     def runtime_build_memory_context(
         self,
@@ -95,3 +98,20 @@ class MemoryRuntime:
             now=now,
             settings=maintenance_settings,
         )
+
+    def runtime_build_graph(self) -> GraphBuildResult:
+        result = self._build_graph()
+        if self.last_graph_error is not None:
+            raise RuntimeError(self.last_graph_error)
+        return result
+
+    def _build_graph(self) -> GraphBuildResult:
+        try:
+            result = self._memory_api.memory_graph_build()
+        except Exception as exc:
+            self.last_graph = None
+            self.last_graph_error = str(exc)
+            return GraphBuildResult(0, 0, 0)
+        self.last_graph = result
+        self.last_graph_error = None
+        return result

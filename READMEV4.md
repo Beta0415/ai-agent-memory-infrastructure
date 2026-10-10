@@ -25,11 +25,13 @@ The project uses Python 3.13 and is managed with
 - Atomic score: spaCy `en_core_web_sm`
 - Vector store: PostgreSQL with pgvector
 
+
+
 ## Setup
 
 1. Copy `.env.example` to `.env`.
 2. Add an OpenAI API key:
-   ```dotenv
+  ```dotenv
    OPENAI_API_KEY=your-api-key-here
    OPENAI_MODEL=gpt-4o-mini
    MEMORY_SELECTOR_MODEL=gpt-5.6-luna
@@ -42,19 +44,19 @@ The project uses Python 3.13 and is managed with
    MEMORY_DEDUP_MODEL=gpt-5-mini
    OPENAI_EMBEDDING_MODEL=text-embedding-3-small
    DATABASE_URL=postgresql://localhost:5432/agent_memory
-   ```
+  ```
 3. Run PostgreSQL with the pgvector extension. The default URL expects a
-   local server on port 5432. The app creates the `agent_memory` database
+  local server on port 5432. The app creates the `agent_memory` database
    and the `memories`, `memory_links`, and `memory_bin` tables when they
    are missing.
 4. Install the locked dependencies, including the spaCy English model:
-   ```bash
+  ```bash
    uv sync
-   ```
+  ```
 5. Start the interface:
-   ```bash
+  ```bash
    uv run streamlit run src/ai_agent_memory_infrastructure/app.py
-   ```
+  ```
 
 The interface is available at `http://localhost:8501`.
 
@@ -74,11 +76,15 @@ is not given them as tools yet. The Python runtime calls them automatically.
 - `memory_update(memory_id, ...)`: changes one stored memory
 - `memory_delete(memory_id)`: deletes one stored memory and its links
 
+
+
 ### Runtime Functions
 
 - `runtime_build_memory_context()`: calls `memory_context()` and formats the result for the main model
 - `runtime_write_memory()`: calls `memory_add()` after a successful main-model response, then runs maintenance when the stored token total is over capacity
 - `runtime_run_maintenance()`: calls `memory_maintain()` from the sidebar button
+
+
 
 ### Internal Functions
 
@@ -122,6 +128,8 @@ them for the next message.
 - `count()`: returns the number of stored memories
 - `clear()`: deletes all stored memories, links, and `memory_bin` rows
 
+
+
 ## Three Memory Paths
 
 The architecture is divided into a Write Path, a Read Path, and a
@@ -163,6 +171,8 @@ The current Write Path contains:
 15. Content embedding with `text-embedding-3-small`.
 16. Persistent storage in PostgreSQL.
 
+
+
 ### Read Path
 
 Information comes out of memory and is prepared for the main LLM. It answers:
@@ -188,6 +198,8 @@ The current Read Path contains retrieval filters and a context engine:
 14. The ordered memories are formatted into the main-model instructions.
 15. The conversation itself stays in the Responses API `input` parameter.
 
+
+
 ### Maintenance Path
 
 Maintenance removes stored duplicates and tags inactive memories. It answers:
@@ -206,6 +218,8 @@ The current Maintenance Path contains:
 7. For an equivalent group, the keeper stays, `reinforced_at` is set to now, `expired` is cleared, and the other copies move to `memory_bin`.
 8. A not-equivalent group is left unchanged.
 9. Forget then sets `expired` to true when the latest activity is more than 60 days ago. Status stays unchanged.
+
+
 
 ## Write Path
 
@@ -243,6 +257,8 @@ flowchart TD
     P -->|Contradiction| U[Store both as Conflicted, link CONFLICTS]
     P -->|Related Distinct| V[Store Active and keep the old memory Active]
 ```
+
+
 
 After every successful main-model response, the runtime passes the current
 conversation to `memory_add()`. The memory selector sees raw transcript
@@ -313,6 +329,8 @@ stays with that fact. Examples the selector is given:
 - Keep the school, employer, place, time, or purpose on the fact. `The user is majoring in Economics at New York University.` stays whole. When peers are split, that qualifier is copied onto each memory.
 - Subject, predicate, and object cannot hold a second peer.
 
+
+
 ### Atomic Score
 
 After selection, spaCy scores every candidate from its content. The six raw
@@ -320,6 +338,7 @@ counts are scaled from 0 to 1, then combined:
 
 ```text
 score = 0.35 P + 0.20 L + 0.15 C + 0.10 J + 0.10 V + 0.10 T
+
 ```
 
 - `P` is the predicate count. One asserted action or property stays at 0. Two or more becomes 1.
@@ -361,14 +380,18 @@ related memories do not all share one relation, the label follows the
 closest memory. Python then applies a fixed rule to every memory in that
 related set:
 
-| Relation | New memory | Older memory | Link |
-| --- | --- | --- | --- |
-| Equivalent | Discarded | Stays Active, `reinforced_at` set to now, `expired` cleared | None |
-| Refinement | Stored as Active | Superseded | New `REFINES` old |
-| Supersession | Stored as Active | Superseded | New `SUPERSEDES` old |
-| Correction | Stored as Active | Corrected | New `CORRECTS` old |
-| Contradiction | Stored as Conflicted | Conflicted | New `CONFLICTS` old |
-| Related Distinct | Stored as Active | Stays Active | None |
+
+| Relation         | New memory           | Older memory                                                | Link                 |
+| ---------------- | -------------------- | ----------------------------------------------------------- | -------------------- |
+| Equivalent       | Discarded            | Stays Active, `reinforced_at` set to now, `expired` cleared | None                 |
+| Refinement       | Stored as Active     | Superseded                                                  | New `REFINES` old    |
+| Supersession     | Stored as Active     | Superseded                                                  | New `SUPERSEDES` old |
+| Correction       | Stored as Active     | Corrected                                                   | New `CORRECTS` old   |
+| Contradiction    | Stored as Conflicted | Conflicted                                                  | New `CONFLICTS` old  |
+| Related Distinct | Stored as Active     | Stays Active                                                | None                 |
+
+
+
 
 ### Selector Storage Policy
 
@@ -408,6 +431,8 @@ Typical information not to store:
 - Filler or generic assistant responses
 - Speculation or unconfirmed claims
 - Passwords, API keys, access tokens, credentials, or other secrets
+
+
 
 ## Memory Types
 
@@ -514,6 +539,10 @@ flowchart TD
     S --> T[Format memory context]
     T --> U[Main-model instructions]
 ```
+
+
+
+
 
 ### First Filter: Weighted Retrieval Score
 
@@ -675,6 +704,10 @@ flowchart TD
     P -->|No| R[Leave the memory]
 ```
 
+
+
+
+
 ### Duplicate Search
 
 The pool is every memory whose status is Active or Conflicted, whether or
@@ -759,31 +792,33 @@ candidates, then the weighted pool, then the number returned. Atomic score
 weights must also sum to 1. Dedup importance and recency weights must also
 sum to 1.
 
-| Setting | Default |
-| --- | --- |
-| Semantic Weight | 0.60 |
-| Recency Weight | 0.20 |
-| Importance Weight | 0.20 |
-| Half-Life Days | 30 |
-| Semantic Candidates | 30 |
-| Weighted Candidates | 10 |
-| Returned Memories | 4 |
-| Similarity Threshold | 0.90 |
-| Content Token Limit | 200 |
-| Predicate Weight | 0.35 |
-| List Item Weight | 0.20 |
-| Clause Weight | 0.15 |
-| Coordination Weight | 0.10 |
-| Value Weight | 0.10 |
-| Length Weight | 0.10 |
-| Atomic Score Threshold | 0.20 |
-| Related Similarity | 0.60 |
-| Related Memories | 5 |
-| Memory Token Capacity | 10000 |
-| Dedup Similarity | 0.90 |
-| Dedup Importance Weight | 0.50 |
-| Dedup Recency Weight | 0.50 |
-| Dedup Half-Life Days | 30 |
+
+| Setting                 | Default |
+| ----------------------- | ------- |
+| Semantic Weight         | 0.60    |
+| Recency Weight          | 0.20    |
+| Importance Weight       | 0.20    |
+| Half-Life Days          | 30      |
+| Semantic Candidates     | 30      |
+| Weighted Candidates     | 10      |
+| Returned Memories       | 4       |
+| Similarity Threshold    | 0.90    |
+| Content Token Limit     | 200     |
+| Predicate Weight        | 0.35    |
+| List Item Weight        | 0.20    |
+| Clause Weight           | 0.15    |
+| Coordination Weight     | 0.10    |
+| Value Weight            | 0.10    |
+| Length Weight           | 0.10    |
+| Atomic Score Threshold  | 0.20    |
+| Related Similarity      | 0.60    |
+| Related Memories        | 5       |
+| Memory Token Capacity   | 10000   |
+| Dedup Similarity        | 0.90    |
+| Dedup Importance Weight | 0.50    |
+| Dedup Recency Weight    | 0.50    |
+| Dedup Half-Life Days    | 30      |
+
 
 Duplicate clustering, related-memory search, and maintenance dedup all use a
 strict greater-than comparison. The atomic checker runs when the score is
@@ -875,3 +910,4 @@ compatibility.
 - The main model has no direct memory tools.
 - Ordered transcripts are not persisted outside Streamlit session state.
 - Retrieval scores, clusters, compressed text, and atomic scores are not stored, so they cannot be inspected after the debug session ends.
+

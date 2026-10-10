@@ -33,6 +33,11 @@ from ai_agent_memory_infrastructure.memory_candidate_relation import (
 from ai_agent_memory_infrastructure.memory_dedup import (
     MemoryDedupClassifier,
 )
+from ai_agent_memory_infrastructure.memory_graph import (
+    GraphBuildResult,
+    MemoryGraph,
+    MemoryGraphExtractor,
+)
 from ai_agent_memory_infrastructure.memory_compressor import (
     MemoryCompressor,
 )
@@ -194,6 +199,7 @@ class CandidateMemoryDecision:
     relation: str | None
     stored: Memory | None
     links: tuple[MemoryLink, ...] = ()
+    relations: tuple[tuple[str, str], ...] = ()
     atomic_score: AtomicScore | None = None
     atomic_verdict: str | None = None
     rewritten: tuple[str, ...] = ()
@@ -265,6 +271,15 @@ class MemoryAPI(Protocol):
 
     def memory_total_tokens(self) -> int: ...
 
+    def memory_graph_build(self) -> GraphBuildResult: ...
+
+
+def _shared_relation(relations: tuple[tuple[str, str], ...]) -> str | None:
+    labels = {relation for _memory_id, relation in relations}
+    if len(labels) == 1:
+        return next(iter(labels))
+    return None
+
 
 def _proposition_key(content: str) -> str:
     return " ".join(content.split()).casefold()
@@ -321,6 +336,7 @@ class AgentMemory:
         atomic_checker: MemoryAtomicChecker | None = None,
         atomic_rewriter: MemoryAtomicRewriter | None = None,
         dedup_classifier: MemoryDedupClassifier | None = None,
+        graph_extractor: MemoryGraphExtractor | None = None,
     ) -> None:
         self._store = store
         self._selector = selector
@@ -333,6 +349,7 @@ class AgentMemory:
         self._atomic_checker = atomic_checker
         self._atomic_rewriter = atomic_rewriter
         self._dedup_classifier = dedup_classifier
+        self._graph_extractor = graph_extractor
         self._source = source
         self._session_id = session_id
 
@@ -419,11 +436,11 @@ class AgentMemory:
                 )
             )
             return
-        relation = self._classify_candidate(candidate.content, related)
+        relations = self._classify_candidate(candidate.content, related)
         stored, links = self._apply_candidate_relation(
             candidate,
             related,
-            relation,
+            relations,
             exchange_id,
         )
         if stored is not None:
@@ -432,7 +449,8 @@ class AgentMemory:
             CandidateMemoryDecision(
                 candidate=candidate,
                 related=tuple(related),
-                relation=relation,
+                relation=_shared_relation(relations),
+                relations=relations,
                 stored=stored,
                 links=links,
                 atomic_score=atomic_score,
@@ -545,54 +563,97 @@ class AgentMemory:
         self,
         content: str,
         related: Sequence[MemoryMatch],
-    ) -> str:
+    ) -> tuple[tuple[str, str], ...]:
         if self._candidate_relation_classifier is None:
             raise RuntimeError(
                 "Related memories need a candidate relation classifier."
             )
-        relation = self._candidate_relation_classifier.classify(
+        labeled = self._candidate_relation_classifier.classify(
             content,
             related,
         )
-        label = relation.strip().lower()
-        if label not in CANDIDATE_RELATIONS:
+        relations = {
+            memory_id: relation.strip().lower()
+            for memory_id, relation in labeled
+        }
+        expected = {match.memory.id for match in related}
+        if set(relations) != expected:
+            raise RuntimeError(
+                "The candidate relation classifier did not label every "
+                "related memory."
+            )
+        unknown = [
+            relation
+            for relation in relations.values()
+            if relation not in CANDIDATE_RELATIONS
+        ]
+        if unknown:
             raise RuntimeError(
                 "The candidate relation classifier returned an unknown "
-                f"relation: {relation}"
+                f"relation: {unknown[0]}"
             )
-        return label
+        return tuple(
+            (match.memory.id, relations[match.memory.id]) for match in related
+        )
 
     def _apply_candidate_relation(
         self,
         candidate: MemoryCandidate,
         related: Sequence[MemoryMatch],
-        relation: str,
+        relations: tuple[tuple[str, str], ...],
         exchange_id: str,
     ) -> tuple[Memory | None, tuple[MemoryLink, ...]]:
-        if relation == "equivalent":
+        labels = dict(relations)
+        equivalent_ids = [
+            memory_id
+            for memory_id, relation in relations
+            if relation == "equivalent"
+        ]
+        if equivalent_ids:
             self._store.reinforce_memories(
-                [match.memory.id for match in related],
+                equivalent_ids,
                 reinforced_at=datetime.now(UTC),
             )
+        changing = [
+            match
+            for match in related
+            if labels[match.memory.id]
+            not in ("equivalent", "related_distinct")
+        ]
+        distinct = any(
+            relation == "related_distinct" for _memory_id, relation in relations
+        )
+        if not changing and equivalent_ids:
             return None, ()
-        effect = CANDIDATE_RELATION_EFFECTS[relation]
+        if not changing and distinct:
+            stored = self._write_candidate(candidate, exchange_id)
+            return stored, ()
+        if not changing:
+            return None, ()
+        new_status = (
+            MemoryStatus.CONFLICTED
+            if any(relation == "contradiction" for _memory_id, relation in relations)
+            else MemoryStatus.ACTIVE
+        )
         stored = self._write_candidate(
             candidate,
             exchange_id,
-            status=effect.new_status,
+            status=new_status,
         )
-        if effect.link is None or effect.previous_status is None:
-            return stored, ()
-        links = tuple(
-            self._store.record_memory_link(
-                from_memory_id=stored.id,
-                to_memory_id=match.memory.id,
-                relation=effect.link,
-                to_status=effect.previous_status,
+        links = []
+        for match in changing:
+            effect = CANDIDATE_RELATION_EFFECTS[labels[match.memory.id]]
+            if effect.link is None or effect.previous_status is None:
+                continue
+            links.append(
+                self._store.record_memory_link(
+                    from_memory_id=stored.id,
+                    to_memory_id=match.memory.id,
+                    relation=effect.link,
+                    to_status=effect.previous_status,
+                )
             )
-            for match in related
-        )
-        return stored, links
+        return stored, tuple(links)
 
     def _write_candidate(
         self,
@@ -812,6 +873,11 @@ class AgentMemory:
             now=now or datetime.now(UTC),
             settings=settings,
         )
+
+    def memory_graph_build(self) -> GraphBuildResult:
+        if self._graph_extractor is None:
+            return GraphBuildResult(0, 0, 0)
+        return MemoryGraph(self._store, self._graph_extractor).build()
 
     def clear(self) -> None:
         self._store.clear()

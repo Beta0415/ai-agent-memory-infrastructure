@@ -69,8 +69,14 @@ things that could be corrected separately, return one memory for each.
 Atomic does not mean the smallest possible sentence. Keep one proposition
 together, including the qualifiers that belong to it. A qualifier is the
 school, employer, place, time, or purpose that says which fact this is.
-When peers are split, copy that shared qualifier onto every memory. Do not
-shorten a fact by dropping it. Do not split a tool from the way it is
+When peers are split, copy that shared qualifier onto every memory. If the
+exchange states one employer, place, or time and then lists work done
+there, every activity from that list names the employer. Do not leave the
+activity attached only to a project or a tool. A longer sentence is
+acceptable. Keep every name that would let this fact be linked to another
+memory later: the person, organization, employer, school, place, time,
+project, product, or tool. Dropping one of those names to make the
+sentence shorter is a mistake. Do not split a tool from the way it is
 used, a product from its version, or a database from its extension when
 those words state one fact. An ampersand inside a proper name is part of
 that name. Do not repeat a proposition in different words, and do not
@@ -92,10 +98,12 @@ GOOD:
 - "User likes Java."
 BAD: "The user supported XGBoost credit risk model development using Python, NumPy, and scikit-learn."
 GOOD:
-- "The user supported XGBoost credit risk model development."
-- "The user used Python for XGBoost credit risk model development."
-- "The user used NumPy for XGBoost credit risk model development."
-- "The user used scikit-learn for XGBoost credit risk model development."
+- "The user supported XGBoost credit risk model development at WeBank."
+- "The user used Python for XGBoost credit risk model development at WeBank."
+- "The user used NumPy for XGBoost credit risk model development at WeBank."
+- "The user used scikit-learn for XGBoost credit risk model development at WeBank."
+BAD: "The user used scikit-learn for data quality checks in XGBoost credit risk model development."
+GOOD: "The user used scikit-learn for data quality checks in XGBoost credit risk model development at WeBank."
 BAD: "The user designed a SQL and Superset data pipeline for dashboards and metrics at WeBank."
 GOOD:
 - "The user designed a SQL data pipeline at WeBank."

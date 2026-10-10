@@ -27,6 +27,9 @@ from ai_agent_memory_infrastructure.memory_atomic_checker import (
 from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
     OpenAIMemoryAtomicRewriter,
 )
+from ai_agent_memory_infrastructure.memory_graph import (
+    OpenAIMemoryGraphExtractor,
+)
 from ai_agent_memory_infrastructure.memory_candidate_relation import (
     CANDIDATE_RELATION_EFFECTS,
     OpenAIMemoryCandidateRelationClassifier,
@@ -129,6 +132,14 @@ def get_memory_atomic_rewriter(model: str) -> OpenAIMemoryAtomicRewriter:
 
 
 @st.cache_resource
+def get_memory_graph_extractor(model: str) -> OpenAIMemoryGraphExtractor:
+    return OpenAIMemoryGraphExtractor(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
 def get_memory_candidate_relation_classifier(
     model: str,
 ) -> OpenAIMemoryCandidateRelationClassifier:
@@ -136,6 +147,19 @@ def get_memory_candidate_relation_classifier(
         api_key=os.environ["OPENAI_API_KEY"],
         model=model,
     )
+
+
+def _related_status(relation: str | None, fallback: str) -> str:
+    effect = (
+        CANDIDATE_RELATION_EFFECTS.get(relation)
+        if isinstance(relation, str)
+        else None
+    )
+    if effect is not None and effect.previous_status is not None:
+        return effect.previous_status.value
+    if relation in ("equivalent", "related_distinct"):
+        return "active"
+    return fallback
 
 
 def _candidate_relation_label(relation: str) -> str:
@@ -190,7 +214,11 @@ def _selected_debug_record(candidate, decision) -> dict[str, object]:
                 "id": match.memory.id,
                 "content": match.memory.content,
                 "similarity": match.similarity_score,
-                "status": previous_status,
+                "relation": dict(decision.relations).get(match.memory.id),
+                "status": _related_status(
+                    dict(decision.relations).get(match.memory.id),
+                    previous_status,
+                ),
             }
             for match in decision.related
         ],
@@ -384,10 +412,19 @@ def render_debug_cards(
                         if isinstance(related_status, str) and related_status
                         else ""
                     )
+                    item_relation = item.get("relation")
+                    relation_label = (
+                        _candidate_relation_label(str(item_relation))
+                        if isinstance(item_relation, str) and item_relation
+                        else ""
+                    )
                     prefix = f"{status_label} · " if status_label else ""
+                    relation_prefix = (
+                        f"{relation_label} · " if relation_label else ""
+                    )
                     st.caption(
                         f"{float(item.get('similarity', 0.0)):.3f} · "
-                        f"{prefix}{item.get('content', '')}"
+                        f"{relation_prefix}{prefix}{item.get('content', '')}"
                     )
         with st.expander("Full Record"):
             st.json(record)
@@ -410,16 +447,18 @@ def render_memory_debug_panel(
             turn_number += 1
             turns.append((turn_number, latest_user_message, message))
 
-    if not turns:
-        st.info("No Completed Turns To Debug")
-        return
-
     page = st.radio(
         "Debug Page",
-        ["Breakdown", "Context"],
+        ["Breakdown", "Context", "Link"],
         horizontal=True,
         label_visibility="collapsed",
     )
+    if page == "Link":
+        _render_memory_links()
+        return
+    if not turns:
+        st.info("No Completed Turns To Debug")
+        return
 
     for index, (turn_number, user_message, assistant_message) in enumerate(
         reversed(turns)
@@ -443,6 +482,52 @@ def render_memory_debug_panel(
                 st.error(f"Read Path Error: {read_error}")
             if write_error:
                 st.error(f"Write Path Error: {write_error}")
+
+
+def _render_memory_links() -> None:
+    if memory_store is None:
+        st.info("Memory Unavailable")
+        return
+    records = memory_store.memory_link_records()
+    if not records:
+        st.caption("No Memory Links")
+        return
+    table = pd.DataFrame(
+        [
+            [
+                index,
+                from_content,
+                _link_relation_label(relation),
+                to_content,
+            ]
+            for index, (relation, from_content, to_content) in enumerate(
+                records,
+                start=1,
+            )
+        ],
+        columns=["Index", "Newer Memory", "Relation", "Older Memory"],
+    )
+    st.dataframe(
+        table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Index": st.column_config.NumberColumn(width="small"),
+            "Newer Memory": st.column_config.TextColumn(width="large"),
+            "Relation": st.column_config.TextColumn(width="small"),
+            "Older Memory": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+
+def _link_relation_label(relation: str) -> str:
+    labels = {
+        "REFINES": "Refines",
+        "SUPERSEDES": "Supersedes",
+        "CORRECTS": "Corrects",
+        "CONFLICTS": "Conflicts",
+    }
+    return labels.get(relation, relation)
 
 
 def _render_debug_breakdown(
@@ -1030,6 +1115,9 @@ memory_atomic_rewriter_model = os.getenv(
 memory_dedup_model = os.getenv(
     "MEMORY_DEDUP_MODEL", "gpt-5-mini"
 )
+memory_graph_model = os.getenv(
+    "MEMORY_GRAPH_MODEL", "gpt-5.6-luna"
+)
 
 memory_store = None
 memory_selector = None
@@ -1040,6 +1128,7 @@ memory_candidate_relation_classifier = None
 memory_atomic_checker = None
 memory_atomic_rewriter = None
 memory_dedup_classifier = None
+memory_graph_extractor = None
 memory_error = None
 if api_key:
     try:
@@ -1063,6 +1152,9 @@ if api_key:
         )
         memory_dedup_classifier = get_memory_dedup_classifier(
             memory_dedup_model
+        )
+        memory_graph_extractor = get_memory_graph_extractor(
+            memory_graph_model
         )
     except Exception as exc:
         memory_error = str(exc)
@@ -1098,6 +1190,7 @@ memory_api = (
         atomic_checker=memory_atomic_checker,
         atomic_rewriter=memory_atomic_rewriter,
         dedup_classifier=memory_dedup_classifier,
+        graph_extractor=memory_graph_extractor,
     )
     if (
         memory_store
@@ -1109,6 +1202,7 @@ memory_api = (
         and memory_atomic_checker
         and memory_atomic_rewriter
         and memory_dedup_classifier
+        and memory_graph_extractor
     )
     else None
 )
@@ -1161,6 +1255,25 @@ with st.sidebar:
         )
         if maintenance_message:
             st.caption(str(maintenance_message))
+        if st.button("Show Graph Connection (Visual)", use_container_width=True):
+            st.switch_page("pages/graph_connection.py")
+        if st.button("Show Graph Connection (Table)", use_container_width=True):
+            st.switch_page("pages/graph_connection_table.py")
+        if st.button("Build Graph", use_container_width=True):
+            try:
+                built = memory_runtime.runtime_build_graph()
+                st.session_state.graph_message = (
+                    f"Entities {built.entity_count} · "
+                    f"Edges {built.edge_count}"
+                )
+            except Exception as exc:
+                st.session_state.graph_message = (
+                    f"Graph Build Failed: {exc}"
+                )
+            st.rerun()
+        graph_message = st.session_state.pop("graph_message", None)
+        if graph_message:
+            st.caption(str(graph_message))
         if st.button("Clear Saved Memories", use_container_width=True):
             memory_api.clear()
             st.rerun()

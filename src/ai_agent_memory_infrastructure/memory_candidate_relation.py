@@ -77,37 +77,45 @@ CANDIDATE_RELATION_EFFECTS = {
 }
 
 
-class CandidateRelationOutput(BaseModel):
+class CandidateMemoryRelation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    memory_id: str
     relation: CandidateRelation
 
 
+class CandidateRelationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    relations: list[CandidateMemoryRelation]
+
+
 MEMORY_CANDIDATE_RELATION_INSTRUCTIONS = """
-You compare one candidate memory with existing memories that already passed
-a vector similarity check. The existing memories are ordered from closest
-to farthest.
+You compare one candidate memory with each existing memory that already
+passed a vector similarity check. Judge each existing memory on its own.
 
-Return one label for the candidate:
-- equivalent: it states the same facts as the existing memories. Wording
+Return one label for every existing memory id:
+- equivalent: the candidate states the same fact as this memory. Wording
   may differ. It does not add, remove, update, or deny a fact.
-- refinement: it keeps an existing claim and adds detail, precision, or a
-  qualifier. It does not replace the claim or say the old claim was wrong.
-- supersession: it replaces an existing memory because the situation
-  changed. The older memory was reasonable when stored, and the candidate
-  is the new state.
-- correction: it fixes an existing memory that was wrong. The older
-  statement is a mistake, not a past state that later changed.
-- contradiction: it conflicts with an existing memory, and the texts do
-  not show whether the candidate is a correction, a newer state, or an
+- refinement: the candidate keeps this memory's claim and adds detail,
+  precision, or a qualifier. It does not replace the claim or say this
+  memory was wrong. A shorter sentence that drops a school, employer,
+  place, time, or project is not a refinement.
+- supersession: the candidate replaces this memory because the situation
+  changed. This memory was reasonable when stored, and the candidate is
+  the new state.
+- correction: the candidate fixes this memory because this memory was
+  wrong. This memory is a mistake, not a past state that later changed.
+- contradiction: the candidate conflicts with this memory, and the texts
+  do not show whether the candidate is a correction, a newer state, or an
   unresolved disagreement.
-- related_distinct: it is about the same subject but states a separate
-  fact that should stay beside the existing memories. It does not restate,
-  refine, replace, correct, or contradict them.
+- related_distinct: the candidate is a separate fact and should stay
+  beside this memory. Another item in the same list is related_distinct.
+  A different course, tool, or task is related_distinct. It does not
+  restate, refine, replace, correct, or contradict this memory.
 
-If one label does not fit every existing memory, use the label that fits
-the closest memory. Do not rewrite, merge, or choose a stored action.
-Return only the label.
+Do not reuse one label for the whole set. Do not rewrite, merge, or
+choose a stored action.
 """.strip()
 
 
@@ -116,7 +124,7 @@ class MemoryCandidateRelationClassifier(Protocol):
         self,
         candidate_content: str,
         related: Sequence[MemoryMatch],
-    ) -> str: ...
+    ) -> Sequence[tuple[str, str]]: ...
 
 
 class OpenAIMemoryCandidateRelationClassifier:
@@ -137,7 +145,7 @@ class OpenAIMemoryCandidateRelationClassifier:
         self,
         candidate_content: str,
         related: Sequence[MemoryMatch],
-    ) -> str:
+    ) -> Sequence[tuple[str, str]]:
         if not candidate_content.strip():
             raise ValueError("Candidate memory content cannot be empty.")
         if not related:
@@ -167,4 +175,7 @@ class OpenAIMemoryCandidateRelationClassifier:
                 "The candidate relation classifier returned no "
                 "structured output."
             )
-        return response.output_parsed.relation
+        return [
+            (item.memory_id, item.relation)
+            for item in response.output_parsed.relations
+        ]

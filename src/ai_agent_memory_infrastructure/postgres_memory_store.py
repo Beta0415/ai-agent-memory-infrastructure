@@ -227,6 +227,74 @@ class PostgresMemoryStore:
                 ON memories USING hnsw (embedding vector_cosine_ops)
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS graph_entities (
+                    entity_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    name_key TEXT NOT NULL UNIQUE,
+                    created_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                    edge_id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL REFERENCES memories(id)
+                        ON DELETE CASCADE,
+                    from_entity_id TEXT NOT NULL
+                        REFERENCES graph_entities(entity_id),
+                    relation TEXT NOT NULL,
+                    to_entity_id TEXT NOT NULL
+                        REFERENCES graph_entities(entity_id),
+                    created_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS graph_edges_memory
+                ON graph_edges (memory_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS graph_builds (
+                    memory_id TEXT PRIMARY KEY REFERENCES memories(id)
+                        ON DELETE CASCADE,
+                    source_key TEXT NOT NULL,
+                    built_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'graph_entities'
+                          AND column_name = 'id'
+                    ) THEN
+                        ALTER TABLE graph_entities
+                        RENAME COLUMN id TO entity_id;
+                    END IF;
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'graph_edges'
+                          AND column_name = 'id'
+                    ) THEN
+                        ALTER TABLE graph_edges
+                        RENAME COLUMN id TO edge_id;
+                    END IF;
+                END $$;
+                """
+            )
         self._connection.commit()
         self._backfill_token_counts()
 
@@ -558,6 +626,7 @@ class PostgresMemoryStore:
                 "SELECT COALESCE(SUM(token_count), 0) AS tokens FROM memories"
             )
             row = cursor.fetchone()
+        self._connection.commit()
         return int(row["tokens"])
 
     def memory_mark_accessed(
@@ -805,6 +874,31 @@ class PostgresMemoryStore:
         self._connection.commit()
         return link
 
+    def memory_link_records(self) -> list[tuple[str, str, str]]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT links.relation,
+                       source.content AS from_content,
+                       target.content AS to_content
+                FROM memory_links AS links
+                JOIN memories AS source
+                    ON source.id = links.from_memory_id
+                JOIN memories AS target
+                    ON target.id = links.to_memory_id
+                ORDER BY links.created_at, links.id
+                """
+            )
+            rows = cursor.fetchall()
+        return [
+            (
+                str(row["relation"]),
+                str(row["from_content"]),
+                str(row["to_content"]),
+            )
+            for row in rows
+        ]
+
     def memory_links_from(self, memory_id: str) -> list[MemoryLink]:
         with self._connection.cursor() as cursor:
             cursor.execute(
@@ -829,15 +923,187 @@ class PostgresMemoryStore:
         with self._connection.cursor() as cursor:
             cursor.execute("SELECT COUNT(*) AS count FROM memories")
             row = cursor.fetchone()
+        self._connection.commit()
         return int(row["count"])
 
     def clear(self) -> None:
         self._rollback_if_aborted()
         with self._connection.cursor() as cursor:
+            cursor.execute("DELETE FROM graph_edges")
+            cursor.execute("DELETE FROM graph_builds")
+            cursor.execute("DELETE FROM graph_entities")
             cursor.execute("DELETE FROM memory_links")
             cursor.execute("DELETE FROM memory_bin")
             cursor.execute("DELETE FROM memories")
         self._connection.commit()
+
+    def graph_source_memories(self) -> list[Memory]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, content, memory_type, role, source, session_id,
+                       importance, created_at, updated_at, metadata, status,
+                       token_count, last_accessed_at, reinforced_at, expired,
+                       subject, predicate, object
+                FROM memories
+                WHERE status = 'active' AND expired = false
+                ORDER BY created_at, id
+                """
+            )
+            rows = cursor.fetchall()
+        return [_memory_from_row(row) for row in rows]
+
+    def graph_source_keys(self) -> dict[str, str]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT memory_id, source_key FROM graph_builds"
+            )
+            rows = cursor.fetchall()
+        return {
+            str(row["memory_id"]): str(row["source_key"]) for row in rows
+        }
+
+    def delete_graph_outside(self, memory_ids: Sequence[str]) -> None:
+        with self._connection.cursor() as cursor:
+            if memory_ids:
+                cursor.execute(
+                    "DELETE FROM graph_edges WHERE NOT (memory_id = ANY(%s))",
+                    (list(memory_ids),),
+                )
+                cursor.execute(
+                    "DELETE FROM graph_builds WHERE NOT (memory_id = ANY(%s))",
+                    (list(memory_ids),),
+                )
+            else:
+                cursor.execute("DELETE FROM graph_edges")
+                cursor.execute("DELETE FROM graph_builds")
+        self._connection.commit()
+
+    def replace_memory_graph(
+        self,
+        memory_id: str,
+        source_key: str,
+        edges: Sequence[tuple[str, str, str]],
+    ) -> None:
+        now = datetime.now(UTC)
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM graph_edges WHERE memory_id = %s",
+                (memory_id,),
+            )
+            for from_entity, relation, to_entity in edges:
+                from_id = _upsert_graph_entity(cursor, from_entity, now)
+                to_id = _upsert_graph_entity(cursor, to_entity, now)
+                cursor.execute(
+                    """
+                    INSERT INTO graph_edges (
+                        edge_id, memory_id, from_entity_id, relation,
+                        to_entity_id, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        uuid4().hex,
+                        memory_id,
+                        from_id,
+                        relation.strip(),
+                        to_id,
+                        now,
+                    ),
+                )
+            cursor.execute(
+                """
+                INSERT INTO graph_builds (memory_id, source_key, built_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (memory_id) DO UPDATE
+                SET source_key = EXCLUDED.source_key,
+                    built_at = EXCLUDED.built_at
+                """,
+                (memory_id, source_key, now),
+            )
+        self._connection.commit()
+
+    def delete_orphan_graph_entities(self) -> None:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM graph_entities
+                WHERE entity_id NOT IN (
+                    SELECT from_entity_id FROM graph_edges
+                    UNION
+                    SELECT to_entity_id FROM graph_edges
+                )
+                """
+            )
+        self._connection.commit()
+
+    def graph_entity_count(self) -> int:
+        with self._connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM graph_entities")
+            row = cursor.fetchone()
+        return int(row["count"])
+
+    def graph_edge_count(self) -> int:
+        with self._connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM graph_edges")
+            row = cursor.fetchone()
+        return int(row["count"])
+
+    def graph_memory_mentions(self) -> list[tuple[str, str, str, str]]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT edge.memory_id, memories.content,
+                       entity.entity_id, entity.name
+                FROM graph_edges AS edge
+                JOIN memories ON memories.id = edge.memory_id
+                JOIN graph_entities AS entity
+                    ON entity.entity_id = edge.from_entity_id
+                UNION
+                SELECT edge.memory_id, memories.content,
+                       entity.entity_id, entity.name
+                FROM graph_edges AS edge
+                JOIN memories ON memories.id = edge.memory_id
+                JOIN graph_entities AS entity
+                    ON entity.entity_id = edge.to_entity_id
+                ORDER BY memory_id, name
+                """
+            )
+            rows = cursor.fetchall()
+        return [
+            (
+                str(row["memory_id"]),
+                str(row["content"]),
+                str(row["entity_id"]),
+                str(row["name"]),
+            )
+            for row in rows
+        ]
+
+    def graph_edge_records(self) -> list[tuple[str, str, str, str]]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT source.name AS from_name, edge.relation,
+                       target.name AS to_name, edge.memory_id
+                FROM graph_edges AS edge
+                JOIN graph_entities AS source
+                    ON source.entity_id = edge.from_entity_id
+                JOIN graph_entities AS target
+                    ON target.entity_id = edge.to_entity_id
+                ORDER BY edge.memory_id, edge.relation, source.name, target.name
+                """
+            )
+            rows = cursor.fetchall()
+        return [
+            (
+                str(row["from_name"]),
+                str(row["relation"]),
+                str(row["to_name"]),
+                str(row["memory_id"]),
+            )
+            for row in rows
+        ]
 
     def _insert(self, memory: Memory, embedding: Sequence[float]) -> None:
         self.import_record(
@@ -903,6 +1169,25 @@ def ensure_database(database_url: str) -> None:
                 )
     finally:
         connection.close()
+
+
+def _upsert_graph_entity(cursor, name: str, now: datetime) -> str:
+    cleaned = name.strip()
+    name_key = " ".join(cleaned.split()).casefold()
+    cursor.execute(
+        """
+        INSERT INTO graph_entities (entity_id, name, name_key, created_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (name_key) DO NOTHING
+        """,
+        (uuid4().hex, cleaned, name_key, now),
+    )
+    cursor.execute(
+        "SELECT entity_id FROM graph_entities WHERE name_key = %s",
+        (name_key,),
+    )
+    row = cursor.fetchone()
+    return str(row["entity_id"])
 
 
 def _filter_clauses(
