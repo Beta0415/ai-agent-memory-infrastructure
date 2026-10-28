@@ -9,6 +9,20 @@ from typing import Protocol
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_agent_memory_infrastructure.memory_entity_judge import (
+    ENTITY_JUDGE_VERDICTS,
+    EntityJudge,
+)
+from ai_agent_memory_infrastructure.memory_entity_selector import (
+    EntitySelector,
+)
+from ai_agent_memory_infrastructure.memory_entity_similarity import (
+    EntityComparison,
+    EntityResolutionSettings,
+    entity_name_key,
+    passes_entity_threshold,
+    score_new_mentions,
+)
 from ai_agent_memory_infrastructure.memory_store import Memory
 from ai_agent_memory_infrastructure.postgres_memory_store import (
     PostgresMemoryStore,
@@ -195,10 +209,6 @@ def memory_connections(
     )
 
 
-def entity_name_key(name: str) -> str:
-    return " ".join(name.split()).casefold()
-
-
 def graph_source_key(memory: Memory) -> str:
     payload = "\n".join(
         (
@@ -217,11 +227,20 @@ class MemoryGraph:
         self,
         store: PostgresMemoryStore,
         extractor: MemoryGraphExtractor,
+        judge: EntityJudge | None = None,
+        selector: EntitySelector | None = None,
     ) -> None:
         self._store = store
         self._extractor = extractor
+        self._judge = judge
+        self._selector = selector
+        self._resolution = EntityResolutionSettings()
 
-    def build(self) -> GraphBuildResult:
+    def build(
+        self,
+        settings: EntityResolutionSettings | None = None,
+    ) -> GraphBuildResult:
+        self._resolution = settings or EntityResolutionSettings()
         current = self._store.graph_source_memories()
         self._store.delete_graph_outside(
             [memory.id for memory in current]
@@ -232,14 +251,17 @@ class MemoryGraph:
             source_key = graph_source_key(memory)
             if stored_keys.get(memory.id) == source_key:
                 continue
-            edges = _unique_edges(self._extractor.extract(memory))
+            resolved, embeddings = self._resolve_mentions(
+                _unique_edges(self._extractor.extract(memory))
+            )
             self._store.replace_memory_graph(
                 memory.id,
                 source_key,
                 [
                     (edge.from_entity, edge.relation, edge.to_entity)
-                    for edge in edges
+                    for edge in resolved
                 ],
+                embeddings,
             )
             built_count += 1
         self._store.delete_orphan_graph_entities()
@@ -248,6 +270,227 @@ class MemoryGraph:
             edge_count=self._store.graph_edge_count(),
             built_count=built_count,
         )
+
+    def _resolve_mentions(
+        self,
+        edges: Sequence[GraphEdgeDraft],
+    ) -> tuple[tuple[GraphEdgeDraft, ...], dict[str, list[float]]]:
+        existing = self._store.graph_entity_names()
+        existing_by_key = {
+            entity_name_key(name): name for _entity_id, name, _embedding in existing
+        }
+        aliases = self._store.graph_entity_alias_names()
+        replacements: dict[str, str] = {}
+        new_mentions: list[str] = []
+        for mention in _mention_names(edges):
+            key = entity_name_key(mention)
+            if key in existing_by_key:
+                continue
+            if key in aliases:
+                replacements[key] = aliases[key]
+                continue
+            new_mentions.append(mention)
+        embeddings: dict[str, list[float]] = {}
+        if new_mentions and existing:
+            comparisons, embeddings = self._score_mentions(new_mentions, existing)
+            grouped: dict[str, list[EntityComparison]] = {}
+            for comparison in comparisons:
+                grouped.setdefault(
+                    entity_name_key(comparison.mention_name),
+                    [],
+                ).append(comparison)
+            for mention in new_mentions:
+                key = entity_name_key(mention)
+                chosen, absorbed = self._chosen_entity(
+                    mention,
+                    grouped.get(key, []),
+                )
+                if chosen is None:
+                    continue
+                replacements[key] = chosen.existing_name
+                for name in absorbed:
+                    replacements[entity_name_key(name)] = chosen.existing_name
+                self._store.record_graph_entity_alias(
+                    mention,
+                    chosen.existing_entity_id,
+                )
+        elif new_mentions:
+            embeddings = self._embed_names(new_mentions)
+        return _rewrite_edges(edges, replacements), embeddings
+
+    def _score_mentions(
+        self,
+        new_mentions: Sequence[str],
+        existing: Sequence[tuple[str, str, list[float] | None]],
+    ) -> tuple[tuple[EntityComparison, ...], dict[str, list[float]]]:
+        vectors_by_key: dict[str, list[float]] = {}
+        missing: list[tuple[str | None, str]] = []
+        for entity_id, name, embedding in existing:
+            key = entity_name_key(name)
+            if embedding is None:
+                missing.append((entity_id, name.strip()))
+            else:
+                vectors_by_key[key] = embedding
+        for name in new_mentions:
+            key = entity_name_key(name)
+            if key not in vectors_by_key:
+                missing.append((None, name.strip()))
+        if missing:
+            texts: list[str] = []
+            seen: set[str] = set()
+            for _entity_id, name in missing:
+                key = entity_name_key(name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                texts.append(name)
+            vectors = self._store.embed_texts(texts)
+            embedded = {
+                entity_name_key(text): vector
+                for text, vector in zip(texts, vectors, strict=True)
+            }
+            vectors_by_key.update(embedded)
+            self._store.save_graph_entity_embeddings(
+                [
+                    (entity_id, embedded[entity_name_key(name)])
+                    for entity_id, name in missing
+                    if entity_id is not None
+                ]
+            )
+        return (
+            score_new_mentions(
+                new_mentions,
+                [(entity_id, name) for entity_id, name, _embedding in existing],
+                vectors_by_key,
+            ),
+            {
+                entity_name_key(name): vectors_by_key[entity_name_key(name)]
+                for name in new_mentions
+            },
+        )
+
+    def _embed_names(self, names: Sequence[str]) -> dict[str, list[float]]:
+        texts: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            key = entity_name_key(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            texts.append(name.strip())
+        vectors = self._store.embed_texts(texts)
+        return {
+            entity_name_key(text): vector
+            for text, vector in zip(texts, vectors, strict=True)
+        }
+
+    def _chosen_entity(
+        self,
+        mention: str,
+        comparisons: Sequence[EntityComparison],
+    ) -> tuple[EntityComparison | None, tuple[str, ...]]:
+        passing = [
+            comparison
+            for comparison in comparisons
+            if passes_entity_threshold(comparison, self._resolution)
+        ]
+        if not passing:
+            return None, ()
+        if self._judge is None:
+            raise RuntimeError(
+                "An entity pair above the similarity threshold needs an "
+                "entity judge."
+            )
+        matched = [
+            comparison
+            for comparison in passing
+            if self._judge_pair(mention, comparison) == "same_entity"
+        ]
+        if not matched:
+            return None, ()
+        if len(matched) == 1:
+            return matched[0], ()
+        chosen = self._select_entity(matched)
+        absorbed = tuple(
+            comparison.existing_name
+            for comparison in matched
+            if comparison.existing_entity_id != chosen.existing_entity_id
+        )
+        self._store.merge_graph_entities(
+            chosen.existing_entity_id,
+            [
+                comparison.existing_entity_id
+                for comparison in matched
+                if comparison.existing_entity_id != chosen.existing_entity_id
+            ],
+        )
+        return chosen, absorbed
+
+    def _select_entity(
+        self,
+        matched: Sequence[EntityComparison],
+    ) -> EntityComparison:
+        if self._selector is None:
+            raise RuntimeError(
+                "Several existing entities judged the same need an entity "
+                "selector."
+            )
+        chosen_name = self._selector.select(
+            [comparison.existing_name for comparison in matched]
+        )
+        chosen_key = entity_name_key(chosen_name)
+        for comparison in matched:
+            if entity_name_key(comparison.existing_name) == chosen_key:
+                return comparison
+        raise RuntimeError(
+            "The entity selector returned a name that was not one of the "
+            f"entities: {chosen_name}"
+        )
+
+    def _judge_pair(self, mention: str, comparison: EntityComparison) -> str:
+        assert self._judge is not None
+        verdict = self._judge.judge(mention, comparison.existing_name)
+        if verdict not in ENTITY_JUDGE_VERDICTS:
+            raise RuntimeError(
+                "The entity judge returned an unknown verdict: "
+                f"{verdict}"
+            )
+        return verdict
+
+
+def _rewrite_edges(
+    edges: Sequence[GraphEdgeDraft],
+    replacements: dict[str, str],
+) -> tuple[GraphEdgeDraft, ...]:
+    rewritten: list[GraphEdgeDraft] = []
+    for edge in edges:
+        rewritten.append(
+            GraphEdgeDraft(
+                from_entity=replacements.get(
+                    entity_name_key(edge.from_entity),
+                    edge.from_entity,
+                ),
+                relation=edge.relation,
+                to_entity=replacements.get(
+                    entity_name_key(edge.to_entity),
+                    edge.to_entity,
+                ),
+            )
+        )
+    return tuple(rewritten)
+
+
+def _mention_names(edges: Sequence[GraphEdgeDraft]) -> tuple[str, ...]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for edge in edges:
+        for name in (edge.from_entity, edge.to_entity):
+            key = entity_name_key(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            names.append(name.strip())
+    return tuple(names)
 
 
 def _unique_edges(

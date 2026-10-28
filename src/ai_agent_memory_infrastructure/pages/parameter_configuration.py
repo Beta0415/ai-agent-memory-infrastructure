@@ -6,6 +6,9 @@ from ai_agent_memory_infrastructure.memory_api import (
     ReadPathSettings,
     WritePathSettings,
 )
+from ai_agent_memory_infrastructure.memory_entity_similarity import (
+    EntityResolutionSettings,
+)
 from ai_agent_memory_infrastructure.memory_maintenance import (
     MaintenanceSettings,
 )
@@ -78,6 +81,20 @@ _seed(
 _seed(
     "param_dedup_half_life_days",
     float(maintenance_applied.half_life_days),
+)
+
+entity_applied = st.session_state.get("entity_resolution_settings")
+if not isinstance(entity_applied, EntityResolutionSettings):
+    entity_applied = EntityResolutionSettings()
+    st.session_state.entity_resolution_settings = entity_applied
+_seed(
+    "param_levenshtein_similarity",
+    entity_applied.levenshtein_threshold,
+)
+_seed("param_jaccard_similarity", entity_applied.jaccard_threshold)
+_seed(
+    "param_embedding_similarity",
+    entity_applied.embedding_threshold,
 )
 
 st.title("Parameter Configuration")
@@ -353,6 +370,41 @@ st.caption(
     "reinforced_at using this half-life."
 )
 
+st.subheader("Entity Resolution")
+levenshtein_column, jaccard_column, embedding_column = st.columns(3)
+with levenshtein_column:
+    st.number_input(
+        "Levenshtein Similarity",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_levenshtein_similarity",
+    )
+with jaccard_column:
+    st.number_input(
+        "Jaccard Similarity",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_jaccard_similarity",
+    )
+with embedding_column:
+    st.number_input(
+        "Embedding Similarity",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_embedding_similarity",
+    )
+st.caption(
+    "A new name is sent to the entity judge when any one of these "
+    "is at or above its threshold. These values apply to the next "
+    "Build Graph."
+)
+
 read_error = None
 write_error = None
 try:
@@ -407,19 +459,44 @@ try:
     )
 except ValueError as exc:
     st.error(str(exc))
+    drafted_maintenance = None
 else:
     st.session_state.maintenance_settings = drafted_maintenance
+
+entity_error = None
+try:
+    drafted_entity = EntityResolutionSettings(
+        levenshtein_threshold=float(
+            st.session_state.param_levenshtein_similarity
+        ),
+        jaccard_threshold=float(st.session_state.param_jaccard_similarity),
+        embedding_threshold=float(
+            st.session_state.param_embedding_similarity
+        ),
+    )
+except ValueError as exc:
+    entity_error = str(exc)
+    drafted_entity = None
+else:
+    st.session_state.entity_resolution_settings = drafted_entity
 
 if read_error:
     st.error(read_error)
 if write_error:
     st.error(write_error)
+if entity_error:
+    st.error(entity_error)
 if (
     drafted_read is not None
     and drafted_write is not None
+    and drafted_entity is not None
     and read_error is None
     and write_error is None
+    and entity_error is None
 ):
     st.session_state.read_path_settings = drafted_read
     st.session_state.write_path_settings = drafted_write
-    st.caption("These values apply to the next message.")
+    st.caption(
+        "Retrieval, write, and maintenance values apply to the next message. "
+        "Entity thresholds apply to the next Build Graph."
+    )

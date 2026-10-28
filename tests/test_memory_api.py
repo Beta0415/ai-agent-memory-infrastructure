@@ -15,6 +15,11 @@ from ai_agent_memory_infrastructure.memory_api import (
 from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
     AtomicRewritePiece,
 )
+from ai_agent_memory_infrastructure.memory_entity_similarity import (
+    embedding_cosine_similarity,
+    jaccard_token_similarity,
+    normalized_levenshtein_similarity,
+)
 from ai_agent_memory_infrastructure.memory_graph import (
     GraphEdgeDraft,
     memory_connections,
@@ -1185,6 +1190,7 @@ class MemoryAPITest(unittest.TestCase):
             source="test",
             session_id="session-2",
             graph_extractor=extractor,
+            entity_judge=ScriptedEntityJudge("not_same_entity"),
         ).memory_graph_build()
 
         self.assertEqual(extractor.calls, [major.id, graduate.id])
@@ -1216,6 +1222,240 @@ class MemoryAPITest(unittest.TestCase):
 
         self.assertEqual(again.built_count, 0)
         self.assertEqual(extractor.calls, [major.id, graduate.id])
+
+    def test_new_entity_mention_is_scored_against_each_existing_entity(
+        self,
+    ) -> None:
+        self._import_dated(
+            "school",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            content="The user studies at New York University.",
+        )
+        self._import_dated(
+            "abbreviation",
+            datetime(2026, 1, 2, tzinfo=UTC),
+            content="The user studies at NYU.",
+        )
+        self._import_dated(
+            "repeated",
+            datetime(2026, 1, 3, tzinfo=UTC),
+            content="The user attends New York University.",
+        )
+        extractor = ScriptedGraphExtractor(
+            {
+                "school": (
+                    ("The user", "studies at", "New York University"),
+                    ("The user", "studies", "Python"),
+                ),
+                "abbreviation": (("The user", "studies at", "NYU"),),
+                "repeated": (
+                    ("The user", "attends", "New York University"),
+                ),
+            }
+        )
+        embedded: list[str] = []
+        original_embed = self.store._embed
+
+        def tracking_embed(texts):
+            embedded.extend(text.casefold() for text in texts)
+            return original_embed(texts)
+
+        self.store._embed = tracking_embed
+        judge = ScriptedEntityJudge("not_same_entity")
+        graph = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+            entity_judge=judge,
+        )
+
+        graph.memory_graph_build()
+
+        self.assertEqual(
+            [existing for _candidate, existing in judge.calls],
+            ["New York University", "The user"],
+        )
+        self.assertEqual(embedded.count("new york university"), 1)
+        self.assertEqual(embedded.count("nyu"), 1)
+        self.assertEqual(self.store.graph_entity_count(), 4)
+        self.assertEqual(self.store.graph_entity_aliases(), ())
+
+    def test_same_entity_judgment_stores_an_alias_instead_of_a_new_entity(
+        self,
+    ) -> None:
+        self._import_dated(
+            "school",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            content="The user studies at New York University.",
+        )
+        self._import_dated(
+            "abbreviation",
+            datetime(2026, 1, 2, tzinfo=UTC),
+            content="The user studies at NYU.",
+        )
+        extractor = ScriptedGraphExtractor(
+            {
+                "school": (
+                    ("The user", "studies at", "New York University"),
+                    ("The user", "studies", "Python"),
+                ),
+                "abbreviation": (("The user", "studies at", "NYU"),),
+            }
+        )
+        judge = ScriptedEntityJudge(
+            {
+                ("nyu", "new york university"): "same_entity",
+                ("nyu", "the user"): "not_same_entity",
+            }
+        )
+        AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+            entity_judge=judge,
+        ).memory_graph_build()
+
+        self.assertEqual(
+            [existing for _candidate, existing in judge.calls],
+            ["New York University", "The user"],
+        )
+        self.assertEqual(self.store.graph_entity_count(), 3)
+        self.assertEqual(
+            self.store.graph_entity_aliases(),
+            (("NYU", "New York University"),),
+        )
+        self.assertNotIn(
+            "NYU",
+            {name for _entity_id, name, _embedding in self.store.graph_entity_names()},
+        )
+        self.assertIn(
+            ("The user", "studies at", "New York University", "abbreviation"),
+            {
+                (record[0], record[1], record[2], record[3])
+                for record in self.store.graph_edge_records()
+            },
+        )
+
+        self._import_dated(
+            "later",
+            datetime(2026, 1, 4, tzinfo=UTC),
+            content="NYU is still the school.",
+        )
+        extractor.edges_by_id["later"] = (("NYU", "is", "NYU"),)
+        AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+            entity_judge=judge,
+        ).memory_graph_build()
+
+        self.assertEqual(len(judge.calls), 2)
+        self.assertEqual(self.store.graph_entity_count(), 3)
+
+    def test_several_same_entities_are_merged_into_the_selected_entity(
+        self,
+    ) -> None:
+        self._import_dated(
+            "school",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            content="The user studies at New York University.",
+        )
+        self._import_dated(
+            "abbreviation",
+            datetime(2026, 1, 2, tzinfo=UTC),
+            content="The user studies at NYU.",
+        )
+        judge = ScriptedEntityJudge(
+            {
+                ("nyu", "new york university"): "same_entity",
+                ("nyu", "the user"): "same_entity",
+            }
+        )
+        selector = ScriptedEntitySelector("New York University")
+        AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=ScriptedGraphExtractor(
+                {
+                    "school": (
+                        ("The user", "studies at", "New York University"),
+                        ("The user", "studies", "Python"),
+                    ),
+                    "abbreviation": (("The user", "studies at", "NYU"),),
+                }
+            ),
+            entity_judge=judge,
+            entity_selector=selector,
+        ).memory_graph_build()
+
+        self.assertEqual(
+            selector.calls,
+            [("New York University", "The user")],
+        )
+        self.assertEqual(
+            {name for _entity_id, name, _embedding in self.store.graph_entity_names()},
+            {"New York University", "Python"},
+        )
+        self.assertEqual(
+            self.store.graph_entity_aliases(),
+            (
+                ("NYU", "New York University"),
+                ("The user", "New York University"),
+            ),
+        )
+        self.assertFalse(
+            any(
+                record[0] == "The user" or record[2] == "The user"
+                for record in self.store.graph_edge_records()
+            )
+        )
+
+    def test_a_name_below_every_threshold_is_stored_without_a_judge(self) -> None:
+        self._import_dated(
+            "tool",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            content="The user uses Python.",
+        )
+        self._import_dated(
+            "animal",
+            datetime(2026, 1, 2, tzinfo=UTC),
+            content="The user saw a zebra.",
+        )
+
+        def embed(texts):
+            vectors = {"python": [1.0, 0.0, 0.0], "zebra": [0.0, 1.0, 0.0]}
+            return [vectors[text.casefold()] for text in texts]
+
+        self.store._embed = embed
+        judge = ScriptedEntityJudge("same_entity")
+        AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=ScriptedGraphExtractor(
+                {
+                    "tool": (("Python", "is used", "Python"),),
+                    "animal": (("Zebra", "was seen", "Zebra"),),
+                }
+            ),
+            entity_judge=judge,
+        ).memory_graph_build()
+
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(
+            {name for _entity_id, name, _embedding in self.store.graph_entity_names()},
+            {"Python", "Zebra"},
+        )
+        self.assertEqual(self.store.graph_entity_aliases(), ())
 
     def test_graph_drops_edges_when_a_memory_is_no_longer_current(self) -> None:
         kept = self.store.write_memory(
@@ -2085,6 +2325,78 @@ class MemoryConnectionTest(unittest.TestCase):
             view.hubs,
             (("user", "The user", ("boston", "gpa", "graduate")),),
         )
+
+
+class EntitySimilarityTest(unittest.TestCase):
+    def test_score_vector_uses_levenshtein_jaccard_and_cosine(self) -> None:
+        self.assertEqual(
+            normalized_levenshtein_similarity("NYU", "nyu"),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            normalized_levenshtein_similarity("cat", "bat"),
+            2 / 3,
+        )
+        self.assertEqual(
+            jaccard_token_similarity(
+                "New York University",
+                "York University",
+            ),
+            2 / 3,
+        )
+        self.assertEqual(jaccard_token_similarity("NYU", "New York University"), 0.0)
+        self.assertAlmostEqual(
+            embedding_cosine_similarity([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            embedding_cosine_similarity([1.0, 0.0], [1.0, 0.0]),
+            1.0,
+        )
+
+    def test_any_score_at_a_threshold_is_ready_for_the_judge(self) -> None:
+        from ai_agent_memory_infrastructure.memory_entity_similarity import (
+            EntityComparison,
+            EntityResolutionSettings,
+            passes_entity_threshold,
+        )
+
+        below = EntityComparison("A", "id", "B", 0.79, 0.49, 0.79)
+        levenshtein = EntityComparison("A", "id", "B", 0.80, 0.0, 0.0)
+        jaccard = EntityComparison("A", "id", "B", 0.0, 0.50, 0.0)
+        embedding = EntityComparison("A", "id", "B", 0.0, 0.0, 0.80)
+        self.assertFalse(passes_entity_threshold(below))
+        self.assertTrue(passes_entity_threshold(levenshtein))
+        self.assertTrue(passes_entity_threshold(jaccard))
+        self.assertTrue(passes_entity_threshold(embedding))
+        stricter = EntityResolutionSettings(levenshtein_threshold=0.90)
+        self.assertFalse(passes_entity_threshold(levenshtein, stricter))
+
+
+class ScriptedEntitySelector:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls: list[tuple[str, ...]] = []
+
+    def select(self, names) -> str:
+        self.calls.append(tuple(names))
+        return self.name
+
+
+class ScriptedEntityJudge:
+    def __init__(self, verdict: str | dict[tuple[str, str], str]) -> None:
+        self.verdict = verdict
+        self.calls: list[tuple[str, str]] = []
+
+    def judge(self, candidate: str, existing: str) -> str:
+        self.calls.append((candidate, existing))
+        if isinstance(self.verdict, dict):
+            from ai_agent_memory_infrastructure.memory_entity_similarity import (
+                entity_name_key,
+            )
+
+            return self.verdict[(entity_name_key(candidate), entity_name_key(existing))]
+        return self.verdict
 
 
 class ScriptedGraphExtractor:

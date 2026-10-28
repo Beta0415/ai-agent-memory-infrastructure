@@ -228,13 +228,20 @@ class PostgresMemoryStore:
                 """
             )
             cursor.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS graph_entities (
                     entity_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     name_key TEXT NOT NULL UNIQUE,
+                    embedding vector({self._dimensions}),
                     created_at TIMESTAMPTZ NOT NULL
                 )
+                """
+            )
+            cursor.execute(
+                f"""
+                ALTER TABLE graph_entities
+                ADD COLUMN IF NOT EXISTS embedding vector({self._dimensions})
                 """
             )
             cursor.execute(
@@ -268,6 +275,18 @@ class PostgresMemoryStore:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS graph_entity_aliases (
+                    alias_name TEXT NOT NULL,
+                    alias_name_key TEXT PRIMARY KEY,
+                    canonical_entity_id TEXT NOT NULL
+                        REFERENCES graph_entities(entity_id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cursor.execute("DROP TABLE IF EXISTS graph_entity_comparisons")
             cursor.execute(
                 """
                 DO $$
@@ -929,6 +948,7 @@ class PostgresMemoryStore:
     def clear(self) -> None:
         self._rollback_if_aborted()
         with self._connection.cursor() as cursor:
+            cursor.execute("DELETE FROM graph_entity_aliases")
             cursor.execute("DELETE FROM graph_edges")
             cursor.execute("DELETE FROM graph_builds")
             cursor.execute("DELETE FROM graph_entities")
@@ -984,16 +1004,28 @@ class PostgresMemoryStore:
         memory_id: str,
         source_key: str,
         edges: Sequence[tuple[str, str, str]],
+        embeddings_by_key: Mapping[str, Sequence[float]] | None = None,
     ) -> None:
         now = datetime.now(UTC)
+        stored_embeddings = embeddings_by_key or {}
         with self._connection.cursor() as cursor:
             cursor.execute(
                 "DELETE FROM graph_edges WHERE memory_id = %s",
                 (memory_id,),
             )
             for from_entity, relation, to_entity in edges:
-                from_id = _upsert_graph_entity(cursor, from_entity, now)
-                to_id = _upsert_graph_entity(cursor, to_entity, now)
+                from_id = _upsert_graph_entity(
+                    cursor,
+                    from_entity,
+                    now,
+                    stored_embeddings.get(_entity_name_key(from_entity)),
+                )
+                to_id = _upsert_graph_entity(
+                    cursor,
+                    to_entity,
+                    now,
+                    stored_embeddings.get(_entity_name_key(to_entity)),
+                )
                 cursor.execute(
                     """
                     INSERT INTO graph_edges (
@@ -1034,6 +1066,206 @@ class PostgresMemoryStore:
                     SELECT to_entity_id FROM graph_edges
                 )
                 """
+            )
+        self._connection.commit()
+
+    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return self._embed(texts)
+
+    def graph_entity_names(self) -> tuple[tuple[str, str, list[float] | None], ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT entity_id, name, embedding
+                FROM graph_entities
+                ORDER BY name_key, entity_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return tuple(
+            (
+                str(row["entity_id"]),
+                str(row["name"]),
+                _vector_or_none(row["embedding"]),
+            )
+            for row in rows
+        )
+
+    def save_graph_entity_embeddings(
+        self,
+        embeddings: Sequence[tuple[str, Sequence[float]]],
+    ) -> None:
+        if not embeddings:
+            return
+        with self._connection.cursor() as cursor:
+            for entity_id, embedding in embeddings:
+                cursor.execute(
+                    """
+                    UPDATE graph_entities
+                    SET embedding = %s
+                    WHERE entity_id = %s AND embedding IS NULL
+                    """,
+                    (list(embedding), entity_id),
+                )
+        self._connection.commit()
+
+    def graph_entity_alias_names(self) -> dict[str, str]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT alias.alias_name_key, entity.name AS canonical_name
+                FROM graph_entity_aliases AS alias
+                JOIN graph_entities AS entity
+                    ON entity.entity_id = alias.canonical_entity_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return {
+            str(row["alias_name_key"]): str(row["canonical_name"])
+            for row in rows
+        }
+
+    def record_graph_entity_alias(
+        self,
+        alias_name: str,
+        canonical_entity_id: str,
+    ) -> None:
+        cleaned = alias_name.strip()
+        name_key = " ".join(cleaned.split()).casefold()
+        now = datetime.now(UTC)
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO graph_entity_aliases (
+                    alias_name, alias_name_key, canonical_entity_id, created_at
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (alias_name_key) DO UPDATE
+                SET alias_name = EXCLUDED.alias_name,
+                    canonical_entity_id = EXCLUDED.canonical_entity_id,
+                    created_at = EXCLUDED.created_at
+                """,
+                (cleaned, name_key, canonical_entity_id, now),
+            )
+        self._connection.commit()
+
+    def graph_entity_aliases(self) -> tuple[tuple[str, str], ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT alias.alias_name, entity.name AS canonical_name
+                FROM graph_entity_aliases AS alias
+                JOIN graph_entities AS entity
+                    ON entity.entity_id = alias.canonical_entity_id
+                ORDER BY alias.alias_name_key
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return tuple(
+            (str(row["alias_name"]), str(row["canonical_name"]))
+            for row in rows
+        )
+
+    def merge_graph_entities(
+        self,
+        canonical_entity_id: str,
+        duplicate_entity_ids: Sequence[str],
+    ) -> None:
+        duplicates = [
+            entity_id
+            for entity_id in duplicate_entity_ids
+            if entity_id != canonical_entity_id
+        ]
+        if not duplicates:
+            return
+        now = datetime.now(UTC)
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT name
+                FROM graph_entities
+                WHERE entity_id = ANY(%s)
+                """,
+                (duplicates,),
+            )
+            rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT name_key FROM graph_entities WHERE entity_id = %s",
+                (canonical_entity_id,),
+            )
+            canonical = cursor.fetchone()
+            if canonical is None:
+                raise KeyError(f"Entity not found: {canonical_entity_id}")
+            canonical_key = str(canonical["name_key"])
+            for row in rows:
+                cleaned = str(row["name"]).strip()
+                name_key = " ".join(cleaned.split()).casefold()
+                if name_key == canonical_key:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO graph_entity_aliases (
+                        alias_name, alias_name_key, canonical_entity_id,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (alias_name_key) DO UPDATE
+                    SET alias_name = EXCLUDED.alias_name,
+                        canonical_entity_id = EXCLUDED.canonical_entity_id,
+                        created_at = EXCLUDED.created_at
+                    """,
+                    (cleaned, name_key, canonical_entity_id, now),
+                )
+            cursor.execute(
+                """
+                UPDATE graph_entity_aliases
+                SET canonical_entity_id = %s
+                WHERE canonical_entity_id = ANY(%s)
+                """,
+                (canonical_entity_id, duplicates),
+            )
+            cursor.execute(
+                """
+                DELETE FROM graph_entity_aliases
+                WHERE alias_name_key = %s
+                """,
+                (canonical_key,),
+            )
+            cursor.execute(
+                """
+                UPDATE graph_edges
+                SET from_entity_id = %s
+                WHERE from_entity_id = ANY(%s)
+                """,
+                (canonical_entity_id, duplicates),
+            )
+            cursor.execute(
+                """
+                UPDATE graph_edges
+                SET to_entity_id = %s
+                WHERE to_entity_id = ANY(%s)
+                """,
+                (canonical_entity_id, duplicates),
+            )
+            cursor.execute(
+                """
+                DELETE FROM graph_edges AS older
+                USING graph_edges AS newer
+                WHERE older.memory_id = newer.memory_id
+                  AND older.from_entity_id = newer.from_entity_id
+                  AND older.relation = newer.relation
+                  AND older.to_entity_id = newer.to_entity_id
+                  AND older.edge_id > newer.edge_id
+                """
+            )
+            cursor.execute(
+                "DELETE FROM graph_entities WHERE entity_id = ANY(%s)",
+                (duplicates,),
             )
         self._connection.commit()
 
@@ -1171,23 +1403,60 @@ def ensure_database(database_url: str) -> None:
         connection.close()
 
 
-def _upsert_graph_entity(cursor, name: str, now: datetime) -> str:
+def _upsert_graph_entity(
+    cursor,
+    name: str,
+    now: datetime,
+    embedding: Sequence[float] | None = None,
+) -> str:
     cleaned = name.strip()
-    name_key = " ".join(cleaned.split()).casefold()
+    name_key = _entity_name_key(cleaned)
     cursor.execute(
         """
-        INSERT INTO graph_entities (entity_id, name, name_key, created_at)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO graph_entities (
+            entity_id, name, name_key, embedding, created_at
+        )
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (name_key) DO NOTHING
         """,
-        (uuid4().hex, cleaned, name_key, now),
+        (
+            uuid4().hex,
+            cleaned,
+            name_key,
+            list(embedding) if embedding is not None else None,
+            now,
+        ),
     )
+    if embedding is not None:
+        cursor.execute(
+            """
+            UPDATE graph_entities
+            SET embedding = %s
+            WHERE name_key = %s AND embedding IS NULL
+            """,
+            (list(embedding), name_key),
+        )
     cursor.execute(
         "SELECT entity_id FROM graph_entities WHERE name_key = %s",
         (name_key,),
     )
     row = cursor.fetchone()
     return str(row["entity_id"])
+
+
+def _entity_name_key(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+def _vector_or_none(value: object) -> list[float] | None:
+    if value is None:
+        return None
+    to_list = getattr(value, "to_list", None)
+    if callable(to_list):
+        value = to_list()
+    elif hasattr(value, "tolist"):
+        value = value.tolist()
+    return [float(item) for item in value]
 
 
 def _filter_clauses(

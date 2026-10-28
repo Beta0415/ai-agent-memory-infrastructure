@@ -10,6 +10,9 @@ from ai_agent_memory_infrastructure.memory_api import (
     ReadPathSettings,
     WritePathSettings,
 )
+from ai_agent_memory_infrastructure.memory_entity_similarity import (
+    EntityResolutionSettings,
+)
 from ai_agent_memory_infrastructure.memory_graph import GraphBuildResult
 from ai_agent_memory_infrastructure.memory_maintenance import (
     MaintenanceResult,
@@ -99,15 +102,21 @@ class MemoryRuntime:
             settings=maintenance_settings,
         )
 
-    def runtime_build_graph(self) -> GraphBuildResult:
-        result = self._build_graph()
+    def runtime_build_graph(
+        self,
+        settings: EntityResolutionSettings | None = None,
+    ) -> GraphBuildResult:
+        result = self._build_graph(settings)
         if self.last_graph_error is not None:
             raise RuntimeError(self.last_graph_error)
         return result
 
-    def _build_graph(self) -> GraphBuildResult:
+    def _build_graph(
+        self,
+        settings: EntityResolutionSettings | None = None,
+    ) -> GraphBuildResult:
         try:
-            result = self._memory_api.memory_graph_build()
+            result = self._memory_api.memory_graph_build(settings)
         except Exception as exc:
             self.last_graph = None
             self.last_graph_error = str(exc)

@@ -33,6 +33,13 @@ from ai_agent_memory_infrastructure.memory_candidate_relation import (
 from ai_agent_memory_infrastructure.memory_dedup import (
     MemoryDedupClassifier,
 )
+from ai_agent_memory_infrastructure.memory_entity_judge import EntityJudge
+from ai_agent_memory_infrastructure.memory_entity_selector import (
+    EntitySelector,
+)
+from ai_agent_memory_infrastructure.memory_entity_similarity import (
+    EntityResolutionSettings,
+)
 from ai_agent_memory_infrastructure.memory_graph import (
     GraphBuildResult,
     MemoryGraph,
@@ -337,6 +344,8 @@ class AgentMemory:
         atomic_rewriter: MemoryAtomicRewriter | None = None,
         dedup_classifier: MemoryDedupClassifier | None = None,
         graph_extractor: MemoryGraphExtractor | None = None,
+        entity_judge: EntityJudge | None = None,
+        entity_selector: EntitySelector | None = None,
     ) -> None:
         self._store = store
         self._selector = selector
@@ -350,6 +359,8 @@ class AgentMemory:
         self._atomic_rewriter = atomic_rewriter
         self._dedup_classifier = dedup_classifier
         self._graph_extractor = graph_extractor
+        self._entity_judge = entity_judge
+        self._entity_selector = entity_selector
         self._source = source
         self._session_id = session_id
 
@@ -874,10 +885,18 @@ class AgentMemory:
             settings=settings,
         )
 
-    def memory_graph_build(self) -> GraphBuildResult:
+    def memory_graph_build(
+        self,
+        settings: EntityResolutionSettings | None = None,
+    ) -> GraphBuildResult:
         if self._graph_extractor is None:
             return GraphBuildResult(0, 0, 0)
-        return MemoryGraph(self._store, self._graph_extractor).build()
+        return MemoryGraph(
+            self._store,
+            self._graph_extractor,
+            self._entity_judge,
+            self._entity_selector,
+        ).build(settings)
 
     def clear(self) -> None:
         self._store.clear()

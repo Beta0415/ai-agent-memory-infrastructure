@@ -27,6 +27,15 @@ from ai_agent_memory_infrastructure.memory_atomic_checker import (
 from ai_agent_memory_infrastructure.memory_atomic_rewriter import (
     OpenAIMemoryAtomicRewriter,
 )
+from ai_agent_memory_infrastructure.memory_entity_judge import (
+    OpenAIEntityJudge,
+)
+from ai_agent_memory_infrastructure.memory_entity_selector import (
+    OpenAIEntitySelector,
+)
+from ai_agent_memory_infrastructure.memory_entity_similarity import (
+    EntityResolutionSettings,
+)
 from ai_agent_memory_infrastructure.memory_graph import (
     OpenAIMemoryGraphExtractor,
 )
@@ -126,6 +135,22 @@ def get_memory_atomic_checker(model: str) -> OpenAIMemoryAtomicChecker:
 @st.cache_resource
 def get_memory_atomic_rewriter(model: str) -> OpenAIMemoryAtomicRewriter:
     return OpenAIMemoryAtomicRewriter(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
+def get_memory_entity_selector(model: str) -> OpenAIEntitySelector:
+    return OpenAIEntitySelector(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
+def get_memory_entity_judge(model: str) -> OpenAIEntityJudge:
+    return OpenAIEntityJudge(
         api_key=os.environ["OPENAI_API_KEY"],
         model=model,
     )
@@ -934,6 +959,15 @@ def current_maintenance_settings() -> MaintenanceSettings:
     return settings
 
 
+def current_entity_resolution_settings() -> EntityResolutionSettings:
+    settings = st.session_state.get("entity_resolution_settings")
+    if isinstance(settings, EntityResolutionSettings):
+        return settings
+    settings = EntityResolutionSettings()
+    st.session_state.entity_resolution_settings = settings
+    return settings
+
+
 def current_write_path_settings() -> WritePathSettings:
     settings = st.session_state.get("write_path_settings")
     if isinstance(settings, WritePathSettings):
@@ -1118,6 +1152,12 @@ memory_dedup_model = os.getenv(
 memory_graph_model = os.getenv(
     "MEMORY_GRAPH_MODEL", "gpt-5.6-luna"
 )
+memory_entity_judge_model = os.getenv(
+    "MEMORY_ENTITY_JUDGE_MODEL", "gpt-5.6-luna"
+)
+memory_entity_selector_model = os.getenv(
+    "MEMORY_ENTITY_SELECTOR_MODEL", "gpt-5.6-luna"
+)
 
 memory_store = None
 memory_selector = None
@@ -1129,6 +1169,8 @@ memory_atomic_checker = None
 memory_atomic_rewriter = None
 memory_dedup_classifier = None
 memory_graph_extractor = None
+memory_entity_judge = None
+memory_entity_selector = None
 memory_error = None
 if api_key:
     try:
@@ -1156,6 +1198,12 @@ if api_key:
         memory_graph_extractor = get_memory_graph_extractor(
             memory_graph_model
         )
+        memory_entity_judge = get_memory_entity_judge(
+            memory_entity_judge_model
+        )
+        memory_entity_selector = get_memory_entity_selector(
+            memory_entity_selector_model
+        )
     except Exception as exc:
         memory_error = str(exc)
 
@@ -1172,6 +1220,8 @@ if "write_path_settings" not in st.session_state:
     st.session_state.write_path_settings = WritePathSettings()
 if "maintenance_settings" not in st.session_state:
     st.session_state.maintenance_settings = MaintenanceSettings()
+if "entity_resolution_settings" not in st.session_state:
+    st.session_state.entity_resolution_settings = EntityResolutionSettings()
 if "maintenance_runs" not in st.session_state:
     st.session_state.maintenance_runs = []
 
@@ -1191,6 +1241,8 @@ memory_api = (
         atomic_rewriter=memory_atomic_rewriter,
         dedup_classifier=memory_dedup_classifier,
         graph_extractor=memory_graph_extractor,
+        entity_judge=memory_entity_judge,
+        entity_selector=memory_entity_selector,
     )
     if (
         memory_store
@@ -1203,6 +1255,8 @@ memory_api = (
         and memory_atomic_rewriter
         and memory_dedup_classifier
         and memory_graph_extractor
+        and memory_entity_judge
+        and memory_entity_selector
     )
     else None
 )
@@ -1261,7 +1315,9 @@ with st.sidebar:
             st.switch_page("pages/graph_connection_table.py")
         if st.button("Build Graph", use_container_width=True):
             try:
-                built = memory_runtime.runtime_build_graph()
+                built = memory_runtime.runtime_build_graph(
+                    current_entity_resolution_settings()
+                )
                 st.session_state.graph_message = (
                     f"Entities {built.entity_count} · "
                     f"Edges {built.edge_count}"

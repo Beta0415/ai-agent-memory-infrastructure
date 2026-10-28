@@ -23,6 +23,8 @@ The project uses Python 3.13 and is managed with
 - Memory compressor: `gpt-5-mini`
 - Dedup classifier: `gpt-5-mini`
 - Graph extractor: `gpt-5.6-luna`
+- Entity judge: `gpt-5.6-luna`
+- Entity selector: `gpt-5.6-luna`
 - Embedding model: `text-embedding-3-small`
 - Atomic score: spaCy `en_core_web_sm`
 - Vector store: PostgreSQL with pgvector
@@ -43,6 +45,8 @@ The project uses Python 3.13 and is managed with
    MEMORY_ATOMIC_REWRITER_MODEL=gpt-5.6-luna
    MEMORY_DEDUP_MODEL=gpt-5-mini
    MEMORY_GRAPH_MODEL=gpt-5.6-luna
+   MEMORY_ENTITY_JUDGE_MODEL=gpt-5.6-luna
+   MEMORY_ENTITY_SELECTOR_MODEL=gpt-5.6-luna
    OPENAI_EMBEDDING_MODEL=text-embedding-3-small
    DATABASE_URL=postgresql://localhost:5432/agent_memory
    ```
@@ -231,9 +235,12 @@ The current Graph Path contains:
 1. The `Build Graph` sidebar button. A write or a maintenance run does not start it.
 2. A read of Active memories whose `expired` tag is false.
 3. One GPT-5.6 Luna call per memory that is new or whose stored text changed.
-4. Entities and edges written to `graph_entities` and `graph_edges`.
-5. An edge that records the memory id it came from.
-6. A memory left out of the current set drops its edges. An entity with no remaining edge is removed.
+4. Each extracted name is checked against the entity names already stored. Capitalization and extra spaces are ignored. A direct match is stored as that existing entity. A name already saved as an alias is connected to that entity. Neither is scored or judged.
+5. Any other name is compared with every entity already stored. The score vector is normalized Levenshtein similarity `L`, Jaccard similarity of the words `J`, and embedding cosine similarity `E`. The name embedding is stored on the `graph_entities` row and reused. Only a name that does not yet have one is sent to the embedding model.
+6. A pair is sent to the entity judge when `L` is at least `0.80`, `J` is at least `0.50`, or `E` is at least `0.80`. Each passing pair is judged on its own. One `Same Entity` result stores the new name as an alias and connects the memory to that existing entity. Several `Same Entity` results are duplicates: a second model chooses the entity to keep, the other existing names and the candidate name become its aliases, and their edges move onto the kept entity. `Not Same Entity` leaves that pair unchanged. When no passing pair is the same entity, the name is stored as a new entity.
+7. Entities and edges written to `graph_entities` and `graph_edges`. An alias is written to `graph_entity_aliases`.
+8. An edge that records the memory id it came from.
+9. A memory left out of the current set drops its edges. An entity with no remaining edge is removed.
 
 ## Write Path
 
@@ -787,16 +794,54 @@ flowchart TD
     C --> D{Text unchanged since last build?}
     D -->|Yes| E[Keep the stored edges]
     D -->|No| F[Extract edges with GPT-5.6 Luna]
-    F --> G[Store entities and edges]
-    E --> H[Drop edges for memories no longer current]
+    F --> N{Exact name of an existing entity?}
+    N -->|Yes| G[Store as that existing entity]
+    N -->|No| P{Saved alias?}
+    P -->|Yes| U[Connect through that existing entity]
+    P -->|No| S[Score the name against existing entities]
+    S --> Q{L at least 0.80, or J at least 0.50, or E at least 0.80?}
+    Q -->|No| W[Store as a new entity]
+    Q -->|Yes| R[Judge that pair]
+    R -->|Not Same Entity| W
+    R -->|One Same Entity| T[Save the candidate as an alias of that entity]
+    R -->|Several Same Entities| M[Choose the entity to keep and merge the others into it]
+    M --> T
+    T --> H[Drop edges for memories no longer current]
+    U --> H
+    E --> H
     G --> H
+    W --> H
     H --> I[Remove entities that no edge uses]
 ```
 
 GPT-5.6 Luna sees one stored memory: its content, subject, predicate, and
 object. It returns edges whose endpoints are entities copied from that
 memory. A school, employer, place, time, or purpose becomes its own entity
-when the memory states it.
+when the memory states it. Before a name is stored, it is checked against
+the entity names already in `graph_entities`. Capitalization and extra
+spaces are ignored. A direct match is stored as that existing entity, with
+no score and no judge. A name already saved as an alias is connected to
+that entity in the same way. Any other name is scored against each entity
+already stored. The score is `[L, J, E]`: `L` is the normalized
+Levenshtein similarity, `J` is the Jaccard similarity of the
+whitespace-separated words, and `E` is the cosine similarity of the two
+name embeddings. An entity's name embedding is stored on that
+`graph_entities` row and reused. Only a name that does not yet have one
+is sent to the embedding model. A pair at or above `L` `0.80`, `J` `0.50`,
+or `E` `0.80`
+is judged on its own by GPT-5.6 Luna. One `Same Entity` result does not
+create a new entity row. The candidate name is saved in
+`graph_entity_aliases`, and the memory is connected through that existing
+entity. When more than one existing name is judged the same entity, those
+entities are duplicates. A second GPT-5.6 Luna call chooses which one to
+keep. Every other existing name is replaced by the chosen entity: its edges
+move onto that entity, and its name is saved as an alias. If two edges on
+the same memory become the same connection after that move, one of those
+edge rows is removed. The relation on the remaining edge stays as it was.
+The candidate
+name is saved as an alias of the chosen entity too. `Not Same Entity`
+leaves that pair separate. If no judged pair is the same entity, the
+candidate name is stored as a new entity.
 
 `The user is majoring in Economics at New York University.` produces:
 
@@ -808,9 +853,11 @@ through that shared entity. The path is memory, edge, entity, edge, other
 memory. `graph_edges.edge_id` is that connection's own id. `memory_id` is the atomic memory it came from. `graph_entities`
 stores one row per entity. `entity_id` is that entity's own id. `name` is
 the text copied from the memory. `name_key` is that name with case and
-extra spaces removed, and it is how two mentions become one entity. `NYU`
-and `New York University` stay separate until both memories use the same
-name. A longer name that contains an organization also emits that
+extra spaces removed, and it is how two mentions become one entity.
+`embedding` is the vector for that name. It is written once and reused
+when a later name is scored. `NYU`
+and `New York University` stay separate names until a `Same Entity`
+judgment stores `NYU` as an alias. A longer name that contains an organization also emits that
 organization. `WeBank's Risk Division` includes `WeBank`, with an edge
 `part of`. `the WeBank AI assistant` includes `WeBank` the same way.
 
@@ -827,9 +874,10 @@ the current graph. Their edges are removed on the next build.
 ## Parameter Configuration
 
 The sidebar button `Parameter Configuration` opens a page in the same
-Streamlit session. A change applies to the next message. Past turns keep the
-scores they were built with. If a draft is invalid, the last valid settings
-remain in use.
+Streamlit session. Retrieval, write, and maintenance changes apply to the
+next message. Past turns keep the scores they were built with. The three
+entity thresholds apply to the next Build Graph. If a draft is invalid, the
+last valid settings remain in use.
 
 Retrieval weights must sum to 1. The cuts must stay in order: semantic
 candidates, then the weighted pool, then the number returned. Atomic score
@@ -861,10 +909,13 @@ sum to 1.
 | Dedup Importance Weight | 0.50 |
 | Dedup Recency Weight | 0.50 |
 | Dedup Half-Life Days | 30 |
+| Levenshtein Similarity | 0.80 |
+| Jaccard Similarity | 0.50 |
+| Embedding Similarity | 0.80 |
 
 Duplicate clustering, related-memory search, and maintenance dedup all use a
 strict greater-than comparison. The atomic checker runs when the score is
-greater than or equal to the atomic score threshold. The content token limit
+greater than or equal to the atomic score threshold. A name pair is sent to the entity judge when Levenshtein similarity, Jaccard similarity, or embedding similarity is greater than or equal to its threshold. The content token limit
 counts memory content only. Maintenance runs when the stored token total is
 greater than the memory token capacity.
 
@@ -948,7 +999,7 @@ compatibility.
 - The read-path relation classifier judges each cluster, and a correct label is not guaranteed.
 - Maintenance keeps at most 5 neighbors per memory, so a duplicate beyond those 5 can be missed.
 - One dedup-classifier call is made per maintenance group of two or more, and a correct label is not guaranteed.
-- One graph-extractor call is made for each current memory that is new or whose stored text changed. Entity names are copied from that memory, so different wordings of the same thing remain different entities.
+- One graph-extractor call is made for each current memory that is new or whose stored text changed. The entity judge is called once per name pair that reaches a similarity threshold, and a same-entity label is not guaranteed. When several existing entities are judged the same, one more model call chooses which entity remains.
 - An equivalent maintenance group deletes the extra copies and their links. Those copies remain in `memory_bin`.
 - A relation-model call is made once per read-path cluster of two or more.
 - A compressor-model call is made only when remaining content exceeds the token budget.
