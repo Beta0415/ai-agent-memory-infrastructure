@@ -4,6 +4,8 @@ import json
 from typing import Literal, Protocol
 
 from openai import OpenAI
+
+from ai_agent_memory_infrastructure.memory_timing import timed
 from pydantic import BaseModel, ConfigDict
 
 
@@ -46,6 +48,7 @@ class OpenAIEntityJudge:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Entity Judge")
     def judge(self, candidate: str, existing: str) -> str:
         if not candidate.strip() or not existing.strip():
             raise ValueError("Entity judgment needs two names.")

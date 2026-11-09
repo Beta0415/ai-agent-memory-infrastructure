@@ -9,6 +9,7 @@ from ai_agent_memory_infrastructure.memory_api import (
 from ai_agent_memory_infrastructure.memory_entity_similarity import (
     EntityResolutionSettings,
 )
+from ai_agent_memory_infrastructure.memory_episode import EpisodeSettings
 from ai_agent_memory_infrastructure.memory_maintenance import (
     MaintenanceSettings,
 )
@@ -96,6 +97,24 @@ _seed(
     "param_embedding_similarity",
     entity_applied.embedding_threshold,
 )
+
+episode_applied = st.session_state.get("episode_settings")
+if not isinstance(episode_applied, EpisodeSettings):
+    episode_applied = EpisodeSettings()
+    st.session_state.episode_settings = episode_applied
+_seed(
+    "param_episode_prevalence_baseline",
+    episode_applied.prevalence_baseline,
+)
+_seed(
+    "param_episode_decay_scale",
+    float(episode_applied.prevalence_decay_scale),
+)
+_seed("param_episode_mean_cohesion", episode_applied.mean_cohesion)
+_seed("param_episode_minimum_cohesion", episode_applied.minimum_cohesion)
+_seed("param_episode_overlap", episode_applied.overlap_threshold)
+_seed("param_episode_containment", episode_applied.containment_threshold)
+_seed("param_episode_novelty", episode_applied.novelty_threshold)
 
 st.title("Parameter Configuration")
 if st.button("Back To Chat"):
@@ -405,6 +424,97 @@ st.caption(
     "Build Graph."
 )
 
+st.subheader("Episodes")
+baseline_column, scale_column = st.columns(2)
+with baseline_column:
+    st.number_input(
+        "Prevalence Baseline",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_episode_prevalence_baseline",
+    )
+with scale_column:
+    st.number_input(
+        "Prevalence Decay Scale",
+        min_value=1.0,
+        max_value=100000.0,
+        step=1.0,
+        format="%.0f",
+        key="param_episode_decay_scale",
+    )
+mean_column, minimum_column, overlap_column = st.columns(3)
+with mean_column:
+    st.number_input(
+        "Mean Cohesion",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_episode_mean_cohesion",
+    )
+with minimum_column:
+    st.number_input(
+        "Minimum Cohesion",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_episode_minimum_cohesion",
+    )
+with overlap_column:
+    st.number_input(
+        "Entity Overlap",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_episode_overlap",
+    )
+containment_column, novelty_column = st.columns(2)
+with containment_column:
+    st.number_input(
+        "Episode Containment",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_episode_containment",
+    )
+with novelty_column:
+    st.number_input(
+        "Episode Novelty",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        format="%.2f",
+        key="param_episode_novelty",
+    )
+st.caption(
+    "Prevalence is the number of active memories containing an entity, "
+    "divided by the total number of active memories, N. "
+    "The bound is (baseline + 0.30) / (1 + N/scale). "
+    "The baseline and the 0.30 both decay toward 0. "
+    "The scale is how many memories cut that bound in half. "
+    "An entity is specific when its prevalence is at or below the bound "
+    "and it is in at least 2 memories. "
+    "The minimum of 2 is fixed. "
+    "A two-entity episode also requires entity overlap at or above Entity "
+    "Overlap. Overlap is the share of the less common entity's memories "
+    "that also contain the other entity. "
+    "A one-entity episode removes a memory whose cosine to the centroid "
+    "is below Minimum Cohesion. "
+    "The episode remains when the memories that stay have mean cohesion "
+    "at or above Mean Cohesion and minimum cohesion at or above Minimum "
+    "Cohesion. "
+    "A two-entity episode does not use the cohesion check. "
+    "After the episodes are formed, one is removed when its containment "
+    "in another episode is at or above Episode Containment and its novelty "
+    "is at or below Episode Novelty. "
+    "These values apply to the next Build Episodes."
+)
+
 read_error = None
 write_error = None
 try:
@@ -480,23 +590,54 @@ except ValueError as exc:
 else:
     st.session_state.entity_resolution_settings = drafted_entity
 
+episode_error = None
+try:
+    drafted_episode = EpisodeSettings(
+        prevalence_baseline=float(
+            st.session_state.param_episode_prevalence_baseline
+        ),
+        prevalence_decay_scale=float(
+            st.session_state.param_episode_decay_scale
+        ),
+        mean_cohesion=float(st.session_state.param_episode_mean_cohesion),
+        minimum_cohesion=float(
+            st.session_state.param_episode_minimum_cohesion
+        ),
+        overlap_threshold=float(st.session_state.param_episode_overlap),
+        containment_threshold=float(
+            st.session_state.param_episode_containment
+        ),
+        novelty_threshold=float(st.session_state.param_episode_novelty),
+    )
+except ValueError as exc:
+    episode_error = str(exc)
+    drafted_episode = None
+else:
+    st.session_state.episode_settings = drafted_episode
+
 if read_error:
     st.error(read_error)
 if write_error:
     st.error(write_error)
 if entity_error:
     st.error(entity_error)
+if episode_error:
+    st.error(episode_error)
 if (
     drafted_read is not None
     and drafted_write is not None
     and drafted_entity is not None
+    and drafted_episode is not None
     and read_error is None
     and write_error is None
     and entity_error is None
+    and episode_error is None
 ):
     st.session_state.read_path_settings = drafted_read
     st.session_state.write_path_settings = drafted_write
     st.caption(
         "Retrieval, write, and maintenance values apply to the next message. "
-        "Entity thresholds apply to the next Build Graph."
+        "Entity thresholds apply to the next Build Graph. "
+        "Prevalence baseline, decay scale, and cohesion apply to the next "
+        "Build Episodes."
     )

@@ -6,6 +6,7 @@ from typing import Literal, Protocol
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
+from ai_agent_memory_infrastructure.memory_timing import timed
 from ai_agent_memory_infrastructure.memory_selector import (
     ATOMIC_MEMORY_STANDARD,
     MemoryCandidate,
@@ -50,6 +51,7 @@ class OpenAIMemoryAtomicChecker:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Atomic Checker")
     def check(self, candidate: MemoryCandidate) -> str:
         if not candidate.content.strip():
             raise ValueError("Candidate memory content cannot be empty.")

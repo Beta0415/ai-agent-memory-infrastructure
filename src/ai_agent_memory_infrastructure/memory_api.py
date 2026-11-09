@@ -40,6 +40,12 @@ from ai_agent_memory_infrastructure.memory_entity_selector import (
 from ai_agent_memory_infrastructure.memory_entity_similarity import (
     EntityResolutionSettings,
 )
+from ai_agent_memory_infrastructure.memory_episode import (
+    EpisodeBuildResult,
+    EpisodeSettings,
+    EpisodeTitler,
+    MemoryEpisode,
+)
 from ai_agent_memory_infrastructure.memory_graph import (
     GraphBuildResult,
     MemoryGraph,
@@ -84,6 +90,7 @@ from ai_agent_memory_infrastructure.memory_selector import (
     MemorySelectionOutput,
     MemorySelector,
 )
+from ai_agent_memory_infrastructure.memory_timing import runtime_span
 from ai_agent_memory_infrastructure.memory_store import (
     RELATED_MEMORY_STATUSES,
     RETRIEVAL_MEMORY_STATUSES,
@@ -197,6 +204,11 @@ class MemoryContextResult:
     deduplicated: bool = False
     dropped_memories: tuple[RetrievedMemory, ...] = ()
     duplicate_clusters: tuple[DuplicateCluster, ...] = ()
+    episodes: tuple = ()
+    ranked: tuple = ()
+    episode_candidates: tuple = ()
+    pool: tuple = ()
+    pool_statuses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,6 +264,16 @@ class MemoryAPI(Protocol):
         settings: ReadPathSettings | None = None,
     ) -> MemoryContextResult: ...
 
+    def memory_hierarchical_context(
+        self,
+        query: str,
+        *,
+        min_similarity: float | None = None,
+        filters: MemoryFilters | None = None,
+        now: datetime | None = None,
+        settings: ReadPathSettings | None = None,
+    ) -> MemoryContextResult: ...
+
     def memory_get(self, memory_id: str) -> Memory | None: ...
 
     def memory_update(
@@ -279,6 +301,11 @@ class MemoryAPI(Protocol):
     def memory_total_tokens(self) -> int: ...
 
     def memory_graph_build(self) -> GraphBuildResult: ...
+
+    def memory_episode_build(
+        self,
+        settings: EpisodeSettings | None = None,
+    ) -> EpisodeBuildResult: ...
 
 
 def _shared_relation(relations: tuple[tuple[str, str], ...]) -> str | None:
@@ -346,6 +373,8 @@ class AgentMemory:
         graph_extractor: MemoryGraphExtractor | None = None,
         entity_judge: EntityJudge | None = None,
         entity_selector: EntitySelector | None = None,
+        episode_titler: EpisodeTitler | None = None,
+        episode_group_selector: object | None = None,
     ) -> None:
         self._store = store
         self._selector = selector
@@ -361,6 +390,8 @@ class AgentMemory:
         self._graph_extractor = graph_extractor
         self._entity_judge = entity_judge
         self._entity_selector = entity_selector
+        self._episode_titler = episode_titler
+        self._episode_group_selector = episode_group_selector
         self._source = source
         self._session_id = session_id
 
@@ -372,30 +403,34 @@ class AgentMemory:
     ) -> MemoryAddResult:
         active = settings or WritePathSettings()
         weights = active.atomic_weights()
-        selection = self._selector.extract_memory(conversation)
+        with runtime_span("Select Memories"):
+            selection = self._selector.extract_memory(conversation)
         exchange_id = uuid4().hex
         stored_memories: list[Memory] = []
         decisions: list[CandidateMemoryDecision] = []
 
-        for candidate in selection.selected:
-            self._process_selected_candidate(
-                candidate,
-                active=active,
-                weights=weights,
-                exchange_id=exchange_id,
-                stored_memories=stored_memories,
-                decisions=decisions,
-                allow_rewrite=True,
-            )
+        with runtime_span("Candidates"):
+            for candidate in selection.selected:
+                self._process_selected_candidate(
+                    candidate,
+                    active=active,
+                    weights=weights,
+                    exchange_id=exchange_id,
+                    stored_memories=stored_memories,
+                    decisions=decisions,
+                    allow_rewrite=True,
+                )
 
+        with runtime_span("Score Skipped"):
+            skipped_scores = tuple(
+                score_atomic_memory(candidate.content, weights=weights)
+                for candidate in selection.not_selected
+            )
         return MemoryAddResult(
             selection=selection,
             stored_memories=tuple(stored_memories),
             decisions=tuple(decisions),
-            not_selected_scores=tuple(
-                score_atomic_memory(candidate.content, weights=weights)
-                for candidate in selection.not_selected
-            ),
+            not_selected_scores=skipped_scores,
         )
 
     def _process_selected_candidate(
@@ -409,16 +444,18 @@ class AgentMemory:
         decisions: list[CandidateMemoryDecision],
         allow_rewrite: bool,
     ) -> None:
-        atomic_score = score_atomic_memory(
-            candidate.content,
-            weights=weights,
-        )
+        with runtime_span("Atomic Score"):
+            atomic_score = score_atomic_memory(
+                candidate.content,
+                weights=weights,
+            )
         verdict = None
         if needs_atomic_review(
             atomic_score.score,
             active.atomic_score_threshold,
         ):
-            verdict = self._check_atomic_candidate(candidate)
+            with runtime_span("Atomic Check"):
+                verdict = self._check_atomic_candidate(candidate)
             if verdict == "invalid":
                 self._reject_or_rewrite_candidate(
                     candidate,
@@ -431,9 +468,11 @@ class AgentMemory:
                     allow_rewrite=allow_rewrite,
                 )
                 return
-        related = self._related_memories(candidate.content, active)
+        with runtime_span("Related Search"):
+            related = self._related_memories(candidate.content, active)
         if not related:
-            stored = self._write_candidate(candidate, exchange_id)
+            with runtime_span("Store Memory"):
+                stored = self._write_candidate(candidate, exchange_id)
             stored_memories.append(stored)
             decisions.append(
                 CandidateMemoryDecision(
@@ -447,13 +486,15 @@ class AgentMemory:
                 )
             )
             return
-        relations = self._classify_candidate(candidate.content, related)
-        stored, links = self._apply_candidate_relation(
-            candidate,
-            related,
-            relations,
-            exchange_id,
-        )
+        with runtime_span("Classify Relation"):
+            relations = self._classify_candidate(candidate.content, related)
+        with runtime_span("Store Memory"):
+            stored, links = self._apply_candidate_relation(
+                candidate,
+                related,
+                relations,
+                exchange_id,
+            )
         if stored is not None:
             stored_memories.append(stored)
         decisions.append(
@@ -484,7 +525,8 @@ class AgentMemory:
     ) -> None:
         replacements: tuple[MemoryCandidate, ...] = ()
         if allow_rewrite:
-            replacements = self._rewrite_atomic_candidate(candidate)
+            with runtime_span("Rewrite"):
+                replacements = self._rewrite_atomic_candidate(candidate)
         decisions.append(
             CandidateMemoryDecision(
                 candidate=candidate,
@@ -706,33 +748,36 @@ class AgentMemory:
             if settings is not None
             else ReadPathSettings(result_limit=limit)
         )
-        semantic_matches = self._store.memory_search(
-            query,
-            limit=active.candidate_limit,
-            min_similarity=min_similarity,
-            filters=_with_current_statuses(filters),
-        )
+        with runtime_span("Semantic Search"):
+            semantic_matches = self._store.memory_search(
+                query,
+                limit=active.candidate_limit,
+                min_similarity=min_similarity,
+                filters=_with_current_statuses(filters),
+            )
         scored_at = now or datetime.now(UTC)
-        self._store.memory_mark_accessed(
-            [match.memory.id for match in semantic_matches],
-            accessed_at=scored_at,
-        )
-        scored_candidates = rank_by_retrieval_score(
-            semantic_matches,
-            limit=max(len(semantic_matches), 1),
-            now=scored_at,
-            semantic_weight=active.semantic_weight,
-            recency_weight=active.recency_weight,
-            importance_weight=active.importance_weight,
-            lambda_per_day=active.recency_lambda_per_day,
-        )
+        with runtime_span("Weighted Score"):
+            self._store.memory_mark_accessed(
+                [match.memory.id for match in semantic_matches],
+                accessed_at=scored_at,
+            )
+            scored_candidates = rank_by_retrieval_score(
+                semantic_matches,
+                limit=max(len(semantic_matches), 1),
+                now=scored_at,
+                semantic_weight=active.semantic_weight,
+                recency_weight=active.recency_weight,
+                importance_weight=active.importance_weight,
+                lambda_per_day=active.recency_lambda_per_day,
+            )
         rerank_pool = scored_candidates[: active.weighted_limit]
         if self._reranker is None or not rerank_pool:
             return MemorySearchResult(
                 matches=tuple(scored_candidates[: active.result_limit]),
                 candidates=scored_candidates,
             )
-        scores = self._reranker.rerank(query, rerank_pool)
+        with runtime_span("Rerank"):
+            scores = self._reranker.rerank(query, rerank_pool)
         reranked = apply_rerank_scores(rerank_pool, scores)
         rerank_scores = {
             item.memory.id: item.rerank_score for item in reranked
@@ -778,35 +823,36 @@ class AgentMemory:
                 matches=(),
                 candidates=search.candidates,
             )
-        embeddings = self._store.memory_embeddings(
-            [item.memory.id for item in search.matches]
-        )
-        groups = cluster_duplicate_memories(
-            search.matches,
-            embeddings,
-            duplicate_similarity=active.duplicate_similarity,
-        )
-        kept: list[RetrievedMemory] = []
-        duplicate_clusters: list[DuplicateCluster] = []
-        for group in groups:
-            if len(group) < 2:
-                kept.extend(group)
-                continue
-            if self._relation_classifier is None:
-                raise RuntimeError(
-                    "Near-duplicate memories need a relation classifier."
-                )
-            relation = self._relation_classifier.classify(group)
-            resolved = resolve_duplicate_group(group, relation)
-            kept.extend(resolved)
-            label = relation.strip().lower()
-            duplicate_clusters.append(
-                DuplicateCluster(
-                    memories=tuple(group),
-                    relation=label,
-                    selected=resolved[0] if label == "equivalent" else None,
-                )
+        with runtime_span("Dedup"):
+            embeddings = self._store.memory_embeddings(
+                [item.memory.id for item in search.matches]
             )
+            groups = cluster_duplicate_memories(
+                search.matches,
+                embeddings,
+                duplicate_similarity=active.duplicate_similarity,
+            )
+            kept: list[RetrievedMemory] = []
+            duplicate_clusters: list[DuplicateCluster] = []
+            for group in groups:
+                if len(group) < 2:
+                    kept.extend(group)
+                    continue
+                if self._relation_classifier is None:
+                    raise RuntimeError(
+                        "Near-duplicate memories need a relation classifier."
+                    )
+                relation = self._relation_classifier.classify(group)
+                resolved = resolve_duplicate_group(group, relation)
+                kept.extend(resolved)
+                label = relation.strip().lower()
+                duplicate_clusters.append(
+                    DuplicateCluster(
+                        memories=tuple(group),
+                        relation=label,
+                        selected=resolved[0] if label == "equivalent" else None,
+                    )
+                )
         memories = tuple(kept)
         kept_ids = {item.memory.id for item in memories}
         dropped_memories = tuple(
@@ -821,12 +867,14 @@ class AgentMemory:
                     "Memory context exceeds the token budget and no "
                     "compressor is configured."
                 )
-            compressed = self._compressor.compress(
-                memories,
-                token_budget=active.token_budget,
-            )
-            memories = apply_context_compression(memories, compressed)
-        memories = order_context_memories(memories)
+            with runtime_span("Compress"):
+                compressed = self._compressor.compress(
+                    memories,
+                    token_budget=active.token_budget,
+                )
+                memories = apply_context_compression(memories, compressed)
+        with runtime_span("Order Memories"):
+            memories = order_context_memories(memories)
         return MemoryContextResult(
             memories=memories,
             matches=search.matches,
@@ -834,6 +882,113 @@ class AgentMemory:
             deduplicated=deduplicated,
             dropped_memories=dropped_memories,
             duplicate_clusters=tuple(duplicate_clusters),
+        )
+
+    def memory_hierarchical_context(
+        self,
+        query: str,
+        *,
+        min_similarity: float | None = None,
+        filters: MemoryFilters | None = None,
+        now: datetime | None = None,
+        settings: ReadPathSettings | None = None,
+    ) -> MemoryContextResult:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            coselect_hierarchical_candidates,
+            hierarchical_atomic_retrieval,
+            hierarchical_episode_retrieval,
+            select_hierarchical_return,
+        )
+
+        active = settings or ReadPathSettings()
+        with runtime_span("Atomic Retrieval"):
+            weighted, candidates = hierarchical_atomic_retrieval(
+                self._store,
+                query,
+                settings=active,
+                min_similarity=min_similarity,
+                filters=_with_current_statuses(filters),
+                now=now,
+            )
+        with runtime_span("Episode Retrieval"):
+            episodes = hierarchical_episode_retrieval(self._store, query)
+        with runtime_span("Rerank"):
+            ranked = coselect_hierarchical_candidates(
+                query,
+                weighted,
+                episodes,
+                self._reranker,
+            )
+        members = self._store.episode_member_ids(
+            [
+                item.episode.episode_id
+                for item in ranked
+                if item.episode is not None
+            ]
+        )
+        with runtime_span("Group Selection"):
+            selected = select_hierarchical_return(
+                query,
+                ranked,
+                members,
+                self._episode_group_selector,
+            )
+        pool_statuses = selected.statuses
+        member_contents = self._store.episode_member_contents(
+            [
+                item.episode.episode_id
+                for item in selected
+                if item.episode is not None
+            ]
+        )
+        selected = tuple(
+            replace(
+                item,
+                episode=replace(
+                    item.episode,
+                    member_contents=member_contents.get(
+                        item.episode.episode_id,
+                        (),
+                    ),
+                ),
+            )
+            if item.episode is not None
+            else item
+            for item in selected
+        )
+        score_by_memory = {
+            item.memory.memory.id: item.score
+            for item in ranked
+            if item.memory is not None
+        }
+        scored_candidates = tuple(
+            replace(
+                item,
+                rerank_score=score_by_memory.get(item.memory.id),
+                final_score=score_by_memory.get(
+                    item.memory.id,
+                    item.final_score,
+                ),
+            )
+            if item.memory.id in score_by_memory
+            else item
+            for item in candidates
+        )
+        return MemoryContextResult(
+            memories=tuple(
+                item.memory for item in selected if item.memory is not None
+            ),
+            matches=tuple(
+                item.memory for item in selected if item.memory is not None
+            ),
+            candidates=scored_candidates,
+            episodes=tuple(
+                item.episode for item in selected if item.episode is not None
+            ),
+            ranked=selected,
+            episode_candidates=episodes,
+            pool=ranked,
+            pool_statuses=pool_statuses,
         )
 
     def memory_get(self, memory_id: str) -> Memory | None:
@@ -897,6 +1052,18 @@ class AgentMemory:
             self._entity_judge,
             self._entity_selector,
         ).build(settings)
+
+    def memory_episode_build(
+        self,
+        settings: EpisodeSettings | None = None,
+    ) -> EpisodeBuildResult:
+        return MemoryEpisode(self._store, self._episode_titler).build(settings)
+
+    def clear_built_graph(self) -> None:
+        self._store.clear_built_graph()
+
+    def clear_built_episodes(self) -> None:
+        self._store.clear_built_episodes()
 
     def clear(self) -> None:
         self._store.clear()

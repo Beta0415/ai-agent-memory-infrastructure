@@ -12,6 +12,7 @@ from ai_agent_memory_infrastructure.memory_candidate_relation import (
     WRITE_RELATED_LIMIT,
     similarity_above,
 )
+from ai_agent_memory_infrastructure.memory_timing import runtime_span
 from ai_agent_memory_infrastructure.memory_dedup import (
     DEDUP_VERDICTS,
     MemoryDedupClassifier,
@@ -169,8 +170,10 @@ class MemoryMaintenance:
         now: datetime,
         settings: MaintenanceSettings | None = None,
     ) -> MaintenanceResult:
-        removed_count, groups = self.deduplicate(now=now, settings=settings)
-        expired = self.forget(now=now)
+        with runtime_span("Deduplicate"):
+            removed_count, groups = self.deduplicate(now=now, settings=settings)
+        with runtime_span("Forget"):
+            expired = self.forget(now=now)
         return MaintenanceResult(
             expired_count=len(expired),
             removed_count=removed_count,

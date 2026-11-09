@@ -8,6 +8,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
 from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+from ai_agent_memory_infrastructure.memory_timing import timed
 
 
 class RelationOutput(BaseModel):
@@ -51,6 +52,7 @@ class OpenAIMemoryRelationClassifier:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Relation Classifier")
     def classify(
         self,
         memories: Sequence[RetrievedMemory],

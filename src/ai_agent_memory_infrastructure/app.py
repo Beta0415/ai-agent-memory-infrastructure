@@ -17,6 +17,13 @@ from ai_agent_memory_infrastructure.memory_dedup import (
     OpenAIMemoryDedupClassifier,
 )
 from ai_agent_memory_infrastructure.memory_context import DuplicateCluster
+from ai_agent_memory_infrastructure.memory_timing import (
+    RuntimeTrace,
+    collapse_runtime_spans,
+    format_runtime_seconds,
+    runtime_span,
+    runtime_trace,
+)
 from ai_agent_memory_infrastructure.memory_maintenance import (
     MaintenanceResult,
     MaintenanceSettings,
@@ -35,6 +42,13 @@ from ai_agent_memory_infrastructure.memory_entity_selector import (
 )
 from ai_agent_memory_infrastructure.memory_entity_similarity import (
     EntityResolutionSettings,
+)
+from ai_agent_memory_infrastructure.memory_episode_group import (
+    OpenAIEpisodeGroupSelector,
+)
+from ai_agent_memory_infrastructure.memory_episode import (
+    EpisodeSettings,
+    OpenAIEpisodeTitler,
 )
 from ai_agent_memory_infrastructure.memory_graph import (
     OpenAIMemoryGraphExtractor,
@@ -143,6 +157,24 @@ def get_memory_atomic_rewriter(model: str) -> OpenAIMemoryAtomicRewriter:
 @st.cache_resource
 def get_memory_entity_selector(model: str) -> OpenAIEntitySelector:
     return OpenAIEntitySelector(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
+def get_memory_episode_group_selector(
+    model: str,
+) -> OpenAIEpisodeGroupSelector:
+    return OpenAIEpisodeGroupSelector(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=model,
+    )
+
+
+@st.cache_resource
+def get_memory_episode_titler(model: str) -> OpenAIEpisodeTitler:
+    return OpenAIEpisodeTitler(
         api_key=os.environ["OPENAI_API_KEY"],
         model=model,
     )
@@ -601,6 +633,51 @@ def _render_llm_prompt(assistant_message: dict[str, object]) -> None:
     st.code(prompt, language=None)
 
 
+def _remember_runtime_trace(trace: RuntimeTrace) -> None:
+    traces = st.session_state.setdefault("runtime_traces", [])
+    if not isinstance(traces, list):
+        traces = []
+        st.session_state.runtime_traces = traces
+    traces.insert(0, trace)
+    del traces[40:]
+
+
+def render_runtime_debug() -> None:
+    st.subheader("Runtime Debug")
+    traces = st.session_state.get("runtime_traces", [])
+    if not isinstance(traces, list) or not traces:
+        st.info("No Runtime Has Been Recorded")
+        return
+    for index, trace in enumerate(traces):
+        if not isinstance(trace, RuntimeTrace):
+            continue
+        heading = (
+            f"{trace.path} · {trace.trigger} · "
+            f"{format_runtime_seconds(trace.seconds)}"
+        )
+        with st.expander(heading, expanded=index == 0):
+            spans = collapse_runtime_spans(trace.spans)
+            if not spans:
+                st.caption("No Timed Sections")
+                continue
+            st.markdown(_runtime_span_markdown(spans))
+
+
+def _runtime_span_markdown(
+    spans: tuple,
+    depth: int = 0,
+) -> str:
+    lines: list[str] = []
+    indent = "  " * depth
+    for span in spans:
+        lines.append(
+            f"{indent}- {span.name} · {format_runtime_seconds(span.seconds)}"
+        )
+        if span.children:
+            lines.append(_runtime_span_markdown(span.children, depth + 1))
+    return "\n".join(lines)
+
+
 def _format_llm_prompt(
     instructions: str,
     messages: list[dict[str, str]],
@@ -760,7 +837,32 @@ def _maintenance_action_label(action: str) -> str:
 def render_retrieval_inspector(
     messages: list[dict[str, object]],
 ) -> None:
-    st.subheader("Retrieval Inspector")
+    st.subheader("Retrieval Inspector (Atomic)")
+    if st.session_state.get("read_path") != "Atomic Read Path":
+        st.info("Select Atomic Read Path To View This Inspector.")
+        return
+    _render_turn_inspector(messages, "Atomic Read Path", _render_atomic_inspector_page)
+
+
+def render_hierarchical_inspector(
+    messages: list[dict[str, object]],
+) -> None:
+    st.subheader("Retrieval Inspector (Hierarchical)")
+    if st.session_state.get("read_path") != "Hierarchical Read Path":
+        st.info("Select Hierarchical Read Path To View This Inspector.")
+        return
+    _render_turn_inspector(
+        messages,
+        "Hierarchical Read Path",
+        _render_hierarchical_inspector_page,
+    )
+
+
+def _render_turn_inspector(
+    messages: list[dict[str, object]],
+    read_path: str,
+    render_page,
+) -> None:
     turns: list[tuple[int, str, dict[str, object]]] = []
     latest_user_message = ""
     turn_number = 0
@@ -770,17 +872,25 @@ def render_retrieval_inspector(
             latest_user_message = str(message["content"])
         elif message["role"] == "assistant":
             turn_number += 1
-            turns.append((turn_number, latest_user_message, message))
+            stored_path = message.get("read_path", "Atomic Read Path")
+            if stored_path == read_path:
+                turns.append((turn_number, latest_user_message, message))
 
     if not turns:
         st.info("No Completed Turns To Inspect")
         return
 
+    page_options = (
+        ["Score", "Context", "Dedup", "Episodes"]
+        if read_path == "Atomic Read Path"
+        else ["Atomic", "Episodes", "Ranking", "Context"]
+    )
     page = st.radio(
         "Inspector Page",
-        ["Score", "Context", "Dedup"],
+        page_options,
         horizontal=True,
         label_visibility="collapsed",
+        key=f"inspector_page_{read_path}",
     )
 
     for index, (turn_number, user_message, assistant_message) in enumerate(
@@ -791,15 +901,170 @@ def render_retrieval_inspector(
             heading += " · Latest"
         with st.expander(heading, expanded=index == 0):
             st.caption(_preview(user_message))
-            if page == "Context":
-                _render_context_summary(assistant_message)
-            elif page == "Dedup":
-                _render_dedup_clusters(assistant_message)
-            else:
-                _render_score_table(assistant_message)
+            render_page(page, assistant_message)
             read_error = assistant_message.get("memory_read_error")
             if read_error:
                 st.error(f"Read Path Error: {read_error}")
+
+
+def _render_atomic_inspector_page(
+    page: str,
+    assistant_message: dict[str, object],
+) -> None:
+    if page == "Context":
+        _render_context_summary(assistant_message)
+    elif page == "Dedup":
+        _render_dedup_clusters(assistant_message)
+    elif page == "Episodes":
+        _render_episode_matches(assistant_message)
+    else:
+        _render_score_table(assistant_message)
+
+
+def _render_hierarchical_inspector_page(
+    page: str,
+    assistant_message: dict[str, object],
+) -> None:
+    if page == "Episodes":
+        _render_hierarchical_episodes(assistant_message)
+    elif page == "Ranking":
+        _render_hierarchical_ranking(assistant_message)
+    elif page == "Context":
+        _render_llm_prompt(assistant_message)
+    else:
+        st.caption("Green Rows Are The Weighted Top 10.")
+        candidates = assistant_message.get("retrieval_candidates", [])
+        weighted_ids = {
+            str(record.get("id", ""))
+            for record in candidates
+            if isinstance(record, dict) and record.get("rerank_score") is not None
+        }
+        _render_score_table(assistant_message, selected_ids=weighted_ids)
+
+
+def _render_hierarchical_episodes(assistant_message: dict[str, object]) -> None:
+    episodes = assistant_message.get("episode_candidates", [])
+    if not isinstance(episodes, list) or not episodes:
+        st.info("No Episode Candidates")
+        return
+    table = pd.DataFrame(
+        [
+            {
+                "Title": episode.get("title", ""),
+                "Summary": episode.get("summary", ""),
+                "Entities": episode.get("entities", ""),
+                "Embedding": episode.get("embedding_score", 0),
+            }
+            for episode in episodes
+            if isinstance(episode, dict)
+        ]
+    )
+    st.dataframe(
+        table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Embedding": st.column_config.NumberColumn(format="%.3f"),
+            "Summary": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+
+def _render_hierarchical_ranking(assistant_message: dict[str, object]) -> None:
+    ranking = assistant_message.get("hierarchical_pool", [])
+    if not isinstance(ranking, list) or not ranking:
+        st.info("No Reranked Candidates")
+        return
+    rows = [item for item in ranking if isinstance(item, dict)]
+    if not rows:
+        st.info("No Reranked Candidates")
+        return
+    st.caption("Green Rows Go Into The Prompt. Red Rows Were Removed.")
+    removed_flags = [item.get("status") == "Removed" for item in rows]
+    selected_flags = [item.get("status") == "Selected" for item in rows]
+    table = pd.DataFrame(
+        [
+            {
+                "Rank": item.get("rank", ""),
+                "Type": item.get("type", ""),
+                "Score": item.get("score", 0),
+                "Status": item.get("status", ""),
+                "Text": item.get("text", ""),
+            }
+            for item in rows
+        ]
+    )
+
+    def paint(row: pd.Series) -> list[str]:
+        if removed_flags[row.name]:
+            return [
+                "background-color: #8d1d1d; color: #fff4f4;"
+            ] * len(row)
+        if selected_flags[row.name]:
+            return [
+                "background-color: #1f7a3a; color: #f4fff6;"
+            ] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        table.style.apply(paint, axis=1),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Score": st.column_config.NumberColumn(format="%.3f"),
+            "Text": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+
+def _render_episode_matches(assistant_message: dict[str, object]) -> None:
+    ranking = assistant_message.get("hierarchical_ranking", [])
+    if isinstance(ranking, list) and ranking:
+        table = pd.DataFrame(
+            [
+                {
+                    "Rank": item.get("rank", ""),
+                    "Type": item.get("type", ""),
+                    "Score": item.get("score", 0),
+                    "Text": item.get("text", ""),
+                }
+                for item in ranking
+                if isinstance(item, dict)
+            ]
+        )
+        st.dataframe(
+            table,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Score": st.column_config.NumberColumn(format="%.3f"),
+            },
+        )
+        return
+    episodes = assistant_message.get("retrieved_episodes", [])
+    if not isinstance(episodes, list) or not episodes:
+        st.info("No Episode Candidates")
+        return
+    table = pd.DataFrame(
+        [
+            {
+                "Title": episode.get("title", ""),
+                "Summary": episode.get("summary", ""),
+                "Members": episode.get("member_count", 0),
+                "Similarity": episode.get("similarity_score", 0),
+            }
+            for episode in episodes
+            if isinstance(episode, dict)
+        ]
+    )
+    st.dataframe(
+        table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Similarity": st.column_config.NumberColumn(format="%.3f"),
+        },
+    )
 
 
 def _render_context_summary(assistant_message: dict[str, object]) -> None:
@@ -874,12 +1139,17 @@ def _post_rerank_ids(assistant_message: dict[str, object]) -> set[str]:
     return selected
 
 
-def _render_score_table(assistant_message: dict[str, object]) -> None:
+def _render_score_table(
+    assistant_message: dict[str, object],
+    *,
+    selected_ids: set[str] | None = None,
+) -> None:
     candidates = assistant_message.get("retrieval_candidates", [])
     if not isinstance(candidates, list) or not candidates:
         st.caption("No Retrieval Candidates")
         return
-    selected_ids = _post_rerank_ids(assistant_message)
+    if selected_ids is None:
+        selected_ids = _post_rerank_ids(assistant_message)
     ordered = sorted(
         candidates,
         key=lambda record: float(record.get("retrieval_score", 0.0)),
@@ -968,6 +1238,15 @@ def current_entity_resolution_settings() -> EntityResolutionSettings:
     return settings
 
 
+def current_episode_settings() -> EpisodeSettings:
+    settings = st.session_state.get("episode_settings")
+    if isinstance(settings, EpisodeSettings):
+        return settings
+    settings = EpisodeSettings()
+    st.session_state.episode_settings = settings
+    return settings
+
+
 def current_write_path_settings() -> WritePathSettings:
     settings = st.session_state.get("write_path_settings")
     if isinstance(settings, WritePathSettings):
@@ -985,10 +1264,40 @@ def generate_assistant_turn(
     memory_runtime: MemoryRuntime | None,
     settings: ReadPathSettings | None = None,
     write_settings: WritePathSettings | None = None,
+    read_path: str = "Atomic Read Path",
+) -> dict[str, object] | None:
+    result = None
+    with runtime_trace("Chat", "Message") as trace:
+        result = _chat_turn(
+            prompt,
+            api_key=api_key,
+            model=model,
+            memory_runtime=memory_runtime,
+            settings=settings,
+            write_settings=write_settings,
+            read_path=read_path,
+        )
+    _remember_runtime_trace(trace)
+    return result
+
+
+def _chat_turn(
+    prompt: str,
+    *,
+    api_key: str,
+    model: str,
+    memory_runtime: MemoryRuntime | None,
+    settings: ReadPathSettings | None = None,
+    write_settings: WritePathSettings | None = None,
+    read_path: str = "Atomic Read Path",
 ) -> dict[str, object] | None:
     memory_context = ""
     retrieved_memories: list[dict[str, object]] = []
     retrieval_candidates: list[dict[str, object]] = []
+    retrieved_episodes: list[dict[str, object]] = []
+    episode_candidates: list[dict[str, object]] = []
+    hierarchical_ranking: list[dict[str, object]] = []
+    hierarchical_pool: list[dict[str, object]] = []
     memory_read_error = None
     deduplicated = False
     deduplicated_memories: list[dict[str, object]] = []
@@ -996,10 +1305,19 @@ def generate_assistant_turn(
     try:
         if memory_runtime:
             try:
-                read_result = memory_runtime.runtime_build_memory_context(
-                    prompt,
-                    settings=settings,
-                )
+                with runtime_span("Read"):
+                    if read_path == "Hierarchical Read Path":
+                        read_result = (
+                            memory_runtime.runtime_build_hierarchical_context(
+                                prompt,
+                                settings=settings,
+                            )
+                        )
+                    else:
+                        read_result = memory_runtime.runtime_build_memory_context(
+                            prompt,
+                            settings=settings,
+                        )
                 memory_context = read_result.text
                 deduplicated = read_result.deduplicated
                 deduplicated_memories = [
@@ -1017,6 +1335,59 @@ def generate_assistant_turn(
                 retrieval_candidates = [
                     serialize_memory_match(candidate)
                     for candidate in read_result.candidates
+                ]
+                retrieved_episodes = [
+                    {
+                        "title": episode.title,
+                        "summary": episode.summary,
+                        "member_count": episode.member_count,
+                        "similarity_score": episode.similarity_score,
+                        "rerank_score": episode.rerank_score,
+                        "entities": ", ".join(episode.entity_names),
+                    }
+                    for episode in read_result.episodes
+                ]
+                hierarchical_ranking = [
+                    {
+                        "rank": index,
+                        "type": item.kind,
+                        "score": item.score,
+                        "text": item.text,
+                    }
+                    for index, item in enumerate(read_result.ranked, start=1)
+                ]
+                episode_candidates = [
+                    {
+                        "title": episode.title,
+                        "summary": episode.summary,
+                        "entities": ", ".join(episode.entity_names),
+                        "embedding_score": episode.similarity_score,
+                    }
+                    for episode in read_result.episode_candidates
+                ]
+                hierarchical_pool = [
+                    {
+                        "rank": index,
+                        "type": (
+                            "Atomic"
+                            if item.memory is not None
+                            else "Episode"
+                        ),
+                        "score": item.score,
+                        "status": {
+                            "selected": "Selected",
+                            "removed": "Removed",
+                        }.get(status, ""),
+                        "text": item.text,
+                    }
+                    for index, (item, status) in enumerate(
+                        zip(
+                            read_result.pool,
+                            read_result.pool_statuses,
+                            strict=True,
+                        ),
+                        start=1,
+                    )
                 ]
             except Exception as exc:
                 memory_read_error = str(exc)
@@ -1037,11 +1408,12 @@ def generate_assistant_turn(
         ]
         llm_prompt = _format_llm_prompt(instructions, prompt_input)
 
-        response = OpenAI(api_key=api_key).responses.create(
-            model=model or "gpt-4o-mini",
-            instructions=instructions,
-            input=prompt_input,
-        )
+        with runtime_span("Main Model"):
+            response = OpenAI(api_key=api_key).responses.create(
+                model=model or "gpt-5.6-sol",
+                instructions=instructions,
+                input=prompt_input,
+            )
         answer = response.output_text
         if not answer:
             raise RuntimeError("OpenAI returned an empty response.")
@@ -1056,6 +1428,11 @@ def generate_assistant_turn(
         "llm_prompt": llm_prompt,
         "retrieved_memories": retrieved_memories,
         "retrieval_candidates": retrieval_candidates,
+        "retrieved_episodes": retrieved_episodes,
+        "episode_candidates": episode_candidates,
+        "hierarchical_ranking": hierarchical_ranking,
+        "hierarchical_pool": hierarchical_pool,
+        "read_path": read_path,
         "deduplicated": deduplicated,
         "deduplicated_memories": deduplicated_memories,
         "duplicate_clusters": duplicate_clusters,
@@ -1158,6 +1535,12 @@ memory_entity_judge_model = os.getenv(
 memory_entity_selector_model = os.getenv(
     "MEMORY_ENTITY_SELECTOR_MODEL", "gpt-5.6-luna"
 )
+memory_episode_title_model = os.getenv(
+    "MEMORY_EPISODE_TITLE_MODEL", "gpt-5.6-luna"
+)
+memory_episode_group_model = os.getenv(
+    "MEMORY_EPISODE_GROUP_MODEL", "gpt-5.6-luna"
+)
 
 memory_store = None
 memory_selector = None
@@ -1171,6 +1554,8 @@ memory_dedup_classifier = None
 memory_graph_extractor = None
 memory_entity_judge = None
 memory_entity_selector = None
+memory_episode_titler = None
+memory_episode_group_selector = None
 memory_error = None
 if api_key:
     try:
@@ -1204,6 +1589,12 @@ if api_key:
         memory_entity_selector = get_memory_entity_selector(
             memory_entity_selector_model
         )
+        memory_episode_titler = get_memory_episode_titler(
+            memory_episode_title_model
+        )
+        memory_episode_group_selector = get_memory_episode_group_selector(
+            memory_episode_group_model
+        )
     except Exception as exc:
         memory_error = str(exc)
 
@@ -1222,6 +1613,10 @@ if "maintenance_settings" not in st.session_state:
     st.session_state.maintenance_settings = MaintenanceSettings()
 if "entity_resolution_settings" not in st.session_state:
     st.session_state.entity_resolution_settings = EntityResolutionSettings()
+if "episode_settings" not in st.session_state:
+    st.session_state.episode_settings = EpisodeSettings()
+if "read_path" not in st.session_state:
+    st.session_state.read_path = "Atomic Read Path"
 if "maintenance_runs" not in st.session_state:
     st.session_state.maintenance_runs = []
 
@@ -1243,6 +1638,8 @@ memory_api = (
         graph_extractor=memory_graph_extractor,
         entity_judge=memory_entity_judge,
         entity_selector=memory_entity_selector,
+        episode_titler=memory_episode_titler,
+        episode_group_selector=memory_episode_group_selector,
     )
     if (
         memory_store
@@ -1257,6 +1654,8 @@ memory_api = (
         and memory_graph_extractor
         and memory_entity_judge
         and memory_entity_selector
+        and memory_episode_titler
+        and memory_episode_group_selector
     )
     else None
 )
@@ -1266,17 +1665,24 @@ with st.sidebar:
     st.header("Setting")
     model = st.text_input(
         "OpenAI Model",
-        value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        value=os.getenv("OPENAI_MODEL", "gpt-5.6-sol"),
     ).strip()
     if st.button("Parameter Configuration", use_container_width=True):
         st.switch_page("pages/parameter_configuration.py")
+    st.radio(
+        "Read Path",
+        ["Atomic Read Path", "Hierarchical Read Path"],
+        key="read_path",
+    )
     side_panel = st.radio(
         "Side Panel",
         [
             "Off",
             "Show Memory Debug",
-            "Show Retrieval Inspector",
+            "Show Retrieval Inspector (Atomic)",
+            "Show Retrieval Inspector (Hierarchical)",
             "Show Maintenance Run",
+            "Show Runtime Debug",
         ],
         label_visibility="collapsed",
     )
@@ -1294,9 +1700,11 @@ with st.sidebar:
         st.metric("Saved Memories", memory_api.count())
         st.metric("Memory Tokens", memory_api.memory_total_tokens())
         if st.button("Run Maintenance", use_container_width=True):
-            maintained = memory_runtime.runtime_run_maintenance(
-                maintenance_settings=current_maintenance_settings(),
-            )
+            with runtime_trace("Maintenance", "Manual") as trace:
+                maintained = memory_runtime.runtime_run_maintenance(
+                    maintenance_settings=current_maintenance_settings(),
+                )
+            _remember_runtime_trace(trace)
             record_maintenance_run(maintained, "Manual")
             st.session_state.maintenance_message = (
                 f"Expired {maintained.expired_count} Memories · "
@@ -1309,27 +1717,64 @@ with st.sidebar:
         )
         if maintenance_message:
             st.caption(str(maintenance_message))
+        st.divider()
         if st.button("Show Graph Connection (Visual)", use_container_width=True):
             st.switch_page("pages/graph_connection.py")
         if st.button("Show Graph Connection (Table)", use_container_width=True):
             st.switch_page("pages/graph_connection_table.py")
         if st.button("Build Graph", use_container_width=True):
-            try:
-                built = memory_runtime.runtime_build_graph(
-                    current_entity_resolution_settings()
-                )
-                st.session_state.graph_message = (
-                    f"Entities {built.entity_count} · "
-                    f"Edges {built.edge_count}"
-                )
-            except Exception as exc:
-                st.session_state.graph_message = (
-                    f"Graph Build Failed: {exc}"
-                )
+            with runtime_trace("Graph Path", "Build Graph") as trace:
+                try:
+                    built = memory_runtime.runtime_build_graph(
+                        current_entity_resolution_settings()
+                    )
+                    st.session_state.graph_message = (
+                        f"Entities {built.entity_count} · "
+                        f"Edges {built.edge_count}"
+                    )
+                except Exception as exc:
+                    st.session_state.graph_message = (
+                        f"Graph Build Failed: {exc}"
+                    )
+            _remember_runtime_trace(trace)
+            st.rerun()
+        if st.button("Clear Built Graph", use_container_width=True):
+            memory_api.clear_built_graph()
+            st.session_state.graph_message = "Built Graph Cleared"
             st.rerun()
         graph_message = st.session_state.pop("graph_message", None)
         if graph_message:
             st.caption(str(graph_message))
+        st.divider()
+        if st.button("Graph RAG", use_container_width=True):
+            st.switch_page("pages/graph_rag.py")
+        st.divider()
+        if st.button("Build Episodes", use_container_width=True):
+            with runtime_trace("Episode Path", "Build Episodes") as trace:
+                try:
+                    built_episodes = memory_runtime.runtime_build_episodes(
+                        current_episode_settings()
+                    )
+                    st.session_state.episode_message = (
+                        f"Episodes {built_episodes.episode_count} · "
+                        f"Titled {built_episodes.titled_count}"
+                    )
+                except Exception as exc:
+                    st.session_state.episode_message = (
+                        f"Episode Build Failed: {exc}"
+                    )
+            _remember_runtime_trace(trace)
+            st.rerun()
+        if st.button("Show Episodes", use_container_width=True):
+            st.switch_page("pages/episodes.py")
+        if st.button("Clear Built Episodes", use_container_width=True):
+            memory_api.clear_built_episodes()
+            st.session_state.episode_message = "Built Episodes Cleared"
+            st.rerun()
+        episode_message = st.session_state.pop("episode_message", None)
+        if episode_message:
+            st.caption(str(episode_message))
+        st.divider()
         if st.button("Clear Saved Memories", use_container_width=True):
             memory_api.clear()
             st.rerun()
@@ -1357,10 +1802,14 @@ if side_column:
     with side_column:
         if side_panel == "Show Memory Debug":
             render_memory_debug_panel(st.session_state.messages)
-        elif side_panel == "Show Retrieval Inspector":
+        elif side_panel == "Show Retrieval Inspector (Atomic)":
             render_retrieval_inspector(st.session_state.messages)
+        elif side_panel == "Show Retrieval Inspector (Hierarchical)":
+            render_hierarchical_inspector(st.session_state.messages)
         elif side_panel == "Show Maintenance Run":
             render_maintenance_panel()
+        elif side_panel == "Show Runtime Debug":
+            render_runtime_debug()
 
 prompt = st.chat_input("Send A Message", disabled=not api_key)
 if prompt:
@@ -1373,6 +1822,7 @@ if prompt:
             memory_runtime=memory_runtime,
             settings=current_read_path_settings(),
             write_settings=current_write_path_settings(),
+            read_path=st.session_state.read_path,
         )
     if assistant_message:
         st.session_state.messages.append(assistant_message)

@@ -7,6 +7,7 @@ from typing import Protocol
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_agent_memory_infrastructure.memory_timing import timed
 from ai_agent_memory_infrastructure.memory_selector import (
     ATOMIC_MEMORY_STANDARD,
     MemoryCandidate,
@@ -64,6 +65,7 @@ class OpenAIMemoryAtomicRewriter:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Atomic Rewriter")
     def rewrite(
         self,
         candidate: MemoryCandidate,

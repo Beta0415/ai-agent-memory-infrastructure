@@ -8,6 +8,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_agent_memory_infrastructure.memory_store import MemoryType
+from ai_agent_memory_infrastructure.memory_timing import timed
 
 
 class MemoryCandidate(BaseModel):
@@ -246,6 +247,7 @@ class OpenAIMemorySelector:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Selector")
     def extract_memory(
         self,
         conversation: Sequence[Mapping[str, str]],

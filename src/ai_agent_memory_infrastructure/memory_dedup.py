@@ -8,6 +8,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
 from ai_agent_memory_infrastructure.memory_store import Memory
+from ai_agent_memory_infrastructure.memory_timing import timed
 
 
 class DedupVerdictOutput(BaseModel):
@@ -54,6 +55,7 @@ class OpenAIMemoryDedupClassifier:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Dedup Classifier")
     def classify(
         self,
         candidate: Memory,

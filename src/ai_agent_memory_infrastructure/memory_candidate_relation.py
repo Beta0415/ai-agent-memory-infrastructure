@@ -8,6 +8,7 @@ from typing import Literal, Protocol
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
+from ai_agent_memory_infrastructure.memory_timing import timed
 from ai_agent_memory_infrastructure.memory_store import (
     MemoryLinkRelation,
     MemoryMatch,
@@ -141,6 +142,7 @@ class OpenAIMemoryCandidateRelationClassifier:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Candidate Relation")
     def classify(
         self,
         candidate_content: str,

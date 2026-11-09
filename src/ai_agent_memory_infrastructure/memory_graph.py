@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from openai import OpenAI
+
+from ai_agent_memory_infrastructure.memory_timing import runtime_span, timed
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_agent_memory_infrastructure.memory_entity_judge import (
@@ -114,6 +116,7 @@ class OpenAIMemoryGraphExtractor:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Extractor")
     def extract(self, memory: Memory) -> Sequence[GraphEdgeDraft]:
         if not memory.content.strip():
             raise ValueError("Graph extraction needs memory content.")
@@ -241,30 +244,34 @@ class MemoryGraph:
         settings: EntityResolutionSettings | None = None,
     ) -> GraphBuildResult:
         self._resolution = settings or EntityResolutionSettings()
-        current = self._store.graph_source_memories()
-        self._store.delete_graph_outside(
-            [memory.id for memory in current]
-        )
+        with runtime_span("Load Memories"):
+            current = self._store.graph_source_memories()
+            self._store.delete_graph_outside(
+                [memory.id for memory in current]
+            )
         built_count = 0
         stored_keys = self._store.graph_source_keys()
         for memory in current:
             source_key = graph_source_key(memory)
             if stored_keys.get(memory.id) == source_key:
                 continue
-            resolved, embeddings = self._resolve_mentions(
-                _unique_edges(self._extractor.extract(memory))
-            )
-            self._store.replace_memory_graph(
-                memory.id,
-                source_key,
-                [
-                    (edge.from_entity, edge.relation, edge.to_entity)
-                    for edge in resolved
-                ],
-                embeddings,
-            )
+            with runtime_span("Memory"):
+                resolved, embeddings = self._resolve_mentions(
+                    _unique_edges(self._extractor.extract(memory))
+                )
+                with runtime_span("Store Graph"):
+                    self._store.replace_memory_graph(
+                        memory.id,
+                        source_key,
+                        [
+                            (edge.from_entity, edge.relation, edge.to_entity)
+                            for edge in resolved
+                        ],
+                        embeddings,
+                    )
             built_count += 1
-        self._store.delete_orphan_graph_entities()
+        with runtime_span("Drop Orphan Entities"):
+            self._store.delete_orphan_graph_entities()
         return GraphBuildResult(
             entity_count=self._store.graph_entity_count(),
             edge_count=self._store.graph_edge_count(),
@@ -272,6 +279,13 @@ class MemoryGraph:
         )
 
     def _resolve_mentions(
+        self,
+        edges: Sequence[GraphEdgeDraft],
+    ) -> tuple[tuple[GraphEdgeDraft, ...], dict[str, list[float]]]:
+        with runtime_span("Resolve Names"):
+            return self._resolve_mentions_timed(edges)
+
+    def _resolve_mentions_timed(
         self,
         edges: Sequence[GraphEdgeDraft],
     ) -> tuple[tuple[GraphEdgeDraft, ...], dict[str, list[float]]]:

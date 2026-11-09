@@ -8,6 +8,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_agent_memory_infrastructure.memory_entity_similarity import entity_name_key
+from ai_agent_memory_infrastructure.memory_timing import timed
 
 
 class EntityChoiceOutput(BaseModel):
@@ -42,6 +43,7 @@ class OpenAIEntitySelector:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Entity Selector")
     def select(self, names: Sequence[str]) -> str:
         choices = [name.strip() for name in names if name.strip()]
         if len(choices) < 2:

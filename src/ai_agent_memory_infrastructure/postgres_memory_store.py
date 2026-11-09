@@ -13,6 +13,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from ai_agent_memory_infrastructure.memory_context import count_tokens
+from ai_agent_memory_infrastructure.memory_timing import runtime_span
+from ai_agent_memory_infrastructure.memory_episode import EpisodeWrite
 from ai_agent_memory_infrastructure.memory_store import (
     Memory,
     MemoryFilters,
@@ -55,6 +57,10 @@ class PostgresMemoryStore:
         self._prepare_schema()
 
     def _embed(self, texts: Sequence[str]) -> list[list[float]]:
+        with runtime_span("Embed"):
+            return self._embed_request(texts)
+
+    def _embed_request(self, texts: Sequence[str]) -> list[list[float]]:
         response = self._openai.embeddings.create(
             model=self._embedding_model,
             input=list(texts),
@@ -286,6 +292,87 @@ class PostgresMemoryStore:
                 )
                 """
             )
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS memory_episodes (
+                    episode_id TEXT PRIMARY KEY,
+                    entity_key TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    cohesion DOUBLE PRECISION,
+                    minimum_cohesion DOUBLE PRECISION,
+                    cohesion_stddev DOUBLE PRECISION,
+                    member_count INTEGER NOT NULL,
+                    summary TEXT NOT NULL,
+                    embedding vector({self._dimensions})
+                )
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE memory_episodes
+                ADD COLUMN IF NOT EXISTS cohesion DOUBLE PRECISION
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE memory_episodes
+                ADD COLUMN IF NOT EXISTS minimum_cohesion DOUBLE PRECISION
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE memory_episodes
+                ADD COLUMN IF NOT EXISTS cohesion_stddev DOUBLE PRECISION
+                """
+            )
+            cursor.execute(
+                f"""
+                ALTER TABLE memory_episodes
+                ADD COLUMN IF NOT EXISTS embedding vector({self._dimensions})
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_episode_members (
+                    episode_id TEXT NOT NULL
+                        REFERENCES memory_episodes(episode_id) ON DELETE CASCADE,
+                    memory_id TEXT NOT NULL
+                        REFERENCES memories(id) ON DELETE CASCADE,
+                    PRIMARY KEY (episode_id, memory_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE memory_episodes AS episode
+                SET member_count = (
+                    SELECT COUNT(*)
+                    FROM memory_episode_members AS member
+                    WHERE member.episode_id = episode.episode_id
+                )
+                WHERE member_count IS NULL
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE memory_episodes
+                ALTER COLUMN member_count SET NOT NULL
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_episode_entities (
+                    episode_id TEXT NOT NULL
+                        REFERENCES memory_episodes(episode_id) ON DELETE CASCADE,
+                    entity_id TEXT NOT NULL
+                        REFERENCES graph_entities(entity_id) ON DELETE CASCADE,
+                    PRIMARY KEY (episode_id, entity_id)
+                )
+                """
+            )
             cursor.execute("DROP TABLE IF EXISTS graph_entity_comparisons")
             cursor.execute(
                 """
@@ -490,6 +577,124 @@ class PostgresMemoryStore:
             )
             for row in rows
         ]
+
+    def episode_search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+    ) -> list[tuple[str, str, str, int, float]]:
+        if not query.strip():
+            raise ValueError("Episode search query cannot be empty.")
+        if limit < 1:
+            raise ValueError("Episode search limit must be at least 1.")
+        vector = self._embed([query])[0]
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT episode_id, title, summary, member_count,
+                       (embedding <=> %s::vector) AS distance
+                FROM memory_episodes
+                WHERE embedding IS NOT NULL
+                ORDER BY distance, episode_id
+                LIMIT %s
+                """,
+                (vector, limit),
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return [
+            (
+                str(row["episode_id"]),
+                str(row["title"]),
+                str(row["summary"]),
+                int(row["member_count"]),
+                1.0 - float(row["distance"]),
+            )
+            for row in rows
+        ]
+
+    def episode_entity_names(
+        self,
+        episode_ids: Sequence[str],
+    ) -> dict[str, tuple[str, ...]]:
+        if not episode_ids:
+            return {}
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT link.episode_id, entity.name
+                FROM memory_episode_entities AS link
+                JOIN graph_entities AS entity
+                    ON entity.entity_id = link.entity_id
+                WHERE link.episode_id = ANY(%s)
+                ORDER BY link.episode_id, entity.name
+                """,
+                (list(episode_ids),),
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        names: dict[str, list[str]] = {}
+        for row in rows:
+            names.setdefault(str(row["episode_id"]), []).append(str(row["name"]))
+        return {
+            episode_id: tuple(entity_names)
+            for episode_id, entity_names in names.items()
+        }
+
+    def episode_member_ids(
+        self,
+        episode_ids: Sequence[str],
+    ) -> dict[str, set[str]]:
+        if not episode_ids:
+            return {}
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT episode_id, memory_id
+                FROM memory_episode_members
+                WHERE episode_id = ANY(%s)
+                """,
+                (list(episode_ids),),
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        members: dict[str, set[str]] = {}
+        for row in rows:
+            members.setdefault(str(row["episode_id"]), set()).add(
+                str(row["memory_id"])
+            )
+        return members
+
+    def episode_member_contents(
+        self,
+        episode_ids: Sequence[str],
+    ) -> dict[str, tuple[str, ...]]:
+        if not episode_ids:
+            return {}
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT link.episode_id, memory.content
+                FROM memory_episode_members AS link
+                JOIN memories AS memory
+                    ON memory.id = link.memory_id
+                WHERE link.episode_id = ANY(%s)
+                ORDER BY link.episode_id, memory.created_at, memory.id
+                """,
+                (list(episode_ids),),
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        contents: dict[str, list[str]] = {}
+        for row in rows:
+            contents.setdefault(str(row["episode_id"]), []).append(
+                str(row["content"])
+            )
+        return {
+            episode_id: tuple(memory_contents)
+            for episode_id, memory_contents in contents.items()
+        }
 
     def memory_embeddings(
         self,
@@ -945,9 +1150,39 @@ class PostgresMemoryStore:
         self._connection.commit()
         return int(row["count"])
 
+    def active_memory_count(self) -> int:
+        self._rollback_if_aborted()
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM memories
+                WHERE status = 'active' AND expired = false
+                """
+            )
+            row = cursor.fetchone()
+        self._connection.commit()
+        return int(row["count"])
+
+    def clear_built_graph(self) -> None:
+        self._rollback_if_aborted()
+        with self._connection.cursor() as cursor:
+            cursor.execute("DELETE FROM graph_entity_aliases")
+            cursor.execute("DELETE FROM graph_edges")
+            cursor.execute("DELETE FROM graph_builds")
+            cursor.execute("DELETE FROM graph_entities")
+        self._connection.commit()
+
+    def clear_built_episodes(self) -> None:
+        self._rollback_if_aborted()
+        with self._connection.cursor() as cursor:
+            cursor.execute("DELETE FROM memory_episodes")
+        self._connection.commit()
+
     def clear(self) -> None:
         self._rollback_if_aborted()
         with self._connection.cursor() as cursor:
+            cursor.execute("DELETE FROM memory_episodes")
             cursor.execute("DELETE FROM graph_entity_aliases")
             cursor.execute("DELETE FROM graph_edges")
             cursor.execute("DELETE FROM graph_builds")
@@ -1289,6 +1524,8 @@ class PostgresMemoryStore:
                        entity.entity_id, entity.name
                 FROM graph_edges AS edge
                 JOIN memories ON memories.id = edge.memory_id
+                    AND memories.status = 'active'
+                    AND memories.expired = false
                 JOIN graph_entities AS entity
                     ON entity.entity_id = edge.from_entity_id
                 UNION
@@ -1296,6 +1533,8 @@ class PostgresMemoryStore:
                        entity.entity_id, entity.name
                 FROM graph_edges AS edge
                 JOIN memories ON memories.id = edge.memory_id
+                    AND memories.status = 'active'
+                    AND memories.expired = false
                 JOIN graph_entities AS entity
                     ON entity.entity_id = edge.to_entity_id
                 ORDER BY memory_id, name
@@ -1311,6 +1550,198 @@ class PostgresMemoryStore:
             )
             for row in rows
         ]
+
+    def memory_episode_states(
+        self,
+    ) -> tuple[tuple[str, str, str, str, str, datetime, datetime, list[float] | None], ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT episode_id, entity_key, title, summary, source_key,
+                       created_at, updated_at, embedding
+                FROM memory_episodes
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return tuple(
+            (
+                str(row["episode_id"]),
+                str(row["entity_key"]),
+                str(row["title"]),
+                str(row["summary"]),
+                str(row["source_key"]),
+                row["created_at"],
+                row["updated_at"],
+                _vector_or_none(row["embedding"]),
+            )
+            for row in rows
+        )
+
+    def sync_memory_episodes(self, episodes: Sequence[EpisodeWrite]) -> None:
+        with self._connection.cursor() as cursor:
+            keys = [episode.entity_key for episode in episodes]
+            if keys:
+                cursor.execute(
+                    """
+                    DELETE FROM memory_episodes
+                    WHERE NOT (entity_key = ANY(%s))
+                    """,
+                    (keys,),
+                )
+            else:
+                cursor.execute("DELETE FROM memory_episodes")
+            for episode in episodes:
+                cursor.execute(
+                    """
+                    INSERT INTO memory_episodes (
+                        episode_id, entity_key, title, summary, source_key,
+                        created_at, updated_at, cohesion,
+                        minimum_cohesion, cohesion_stddev, member_count,
+                        embedding
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (entity_key) DO UPDATE
+                    SET title = EXCLUDED.title,
+                        summary = EXCLUDED.summary,
+                        source_key = EXCLUDED.source_key,
+                        updated_at = EXCLUDED.updated_at,
+                        cohesion = EXCLUDED.cohesion,
+                        minimum_cohesion = EXCLUDED.minimum_cohesion,
+                        cohesion_stddev = EXCLUDED.cohesion_stddev,
+                        member_count = EXCLUDED.member_count,
+                        embedding = EXCLUDED.embedding
+                    RETURNING episode_id
+                    """,
+                    (
+                        episode.episode_id,
+                        episode.entity_key,
+                        episode.title,
+                        episode.summary,
+                        episode.source_key,
+                        episode.created_at,
+                        episode.updated_at,
+                        episode.cohesion,
+                        episode.minimum_cohesion,
+                        episode.cohesion_stddev,
+                        len(episode.memory_ids),
+                        episode.embedding,
+                    ),
+                )
+                stored = cursor.fetchone()
+                episode_id = str(stored["episode_id"])
+                cursor.execute(
+                    "DELETE FROM memory_episode_members WHERE episode_id = %s",
+                    (episode_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM memory_episode_entities WHERE episode_id = %s",
+                    (episode_id,),
+                )
+                for memory_id in episode.memory_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO memory_episode_members (
+                            episode_id, memory_id
+                        )
+                        VALUES (%s, %s)
+                        """,
+                        (episode_id, memory_id),
+                    )
+                for entity_id in episode.entity_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO memory_episode_entities (
+                            episode_id, entity_id
+                        )
+                        VALUES (%s, %s)
+                        """,
+                        (episode_id, entity_id),
+                    )
+        self._connection.commit()
+
+    def memory_episode_groups(
+        self,
+    ) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT episode.episode_id, episode.title,
+                       entity.entity_id, entity.name,
+                       member.memory_id
+                FROM memory_episodes AS episode
+                LEFT JOIN memory_episode_entities AS link
+                    ON link.episode_id = episode.episode_id
+                LEFT JOIN graph_entities AS entity
+                    ON entity.entity_id = link.entity_id
+                LEFT JOIN memory_episode_members AS member
+                    ON member.episode_id = episode.episode_id
+                ORDER BY episode.title, episode.episode_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        grouped: dict[str, dict[str, object]] = {}
+        for row in rows:
+            item = grouped.setdefault(
+                str(row["episode_id"]),
+                {"title": str(row["title"]), "entities": {}, "memories": set()},
+            )
+            entities = item["entities"]
+            memories = item["memories"]
+            assert isinstance(entities, dict)
+            assert isinstance(memories, set)
+            if row["entity_id"] is not None:
+                entities[str(row["entity_id"])] = str(row["name"])
+            if row["memory_id"] is not None:
+                memories.add(str(row["memory_id"]))
+        return tuple(
+            (
+                str(item["title"]),
+                tuple(sorted(item["entities"].values(), key=str.casefold)),
+                tuple(sorted(item["memories"])),
+            )
+            for item in sorted(grouped.values(), key=lambda item: str(item["title"]))
+        )
+
+    def memory_episode_member_counts(self) -> tuple[int, ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT member_count
+                FROM memory_episodes
+                ORDER BY title, episode_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return tuple(int(row["member_count"]) for row in rows)
+
+    def memory_episode_summaries(self) -> tuple[str, ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT summary
+                FROM memory_episodes
+                ORDER BY title, episode_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return tuple(str(row["summary"]) for row in rows)
+
+    def memory_episode_embeddings(self) -> tuple[list[float] | None, ...]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT embedding
+                FROM memory_episodes
+                ORDER BY title, episode_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return tuple(_vector_or_none(row["embedding"]) for row in rows)
 
     def graph_edge_records(self) -> list[tuple[str, str, str, str]]:
         with self._connection.cursor() as cursor:
@@ -1333,6 +1764,144 @@ class PostgresMemoryStore:
                 str(row["relation"]),
                 str(row["to_name"]),
                 str(row["memory_id"]),
+            )
+            for row in rows
+        ]
+
+    def graph_rag_entities(
+        self,
+    ) -> list[tuple[str, str, tuple[float, ...] | None]]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT entity_id, name, embedding
+                FROM graph_entities
+                ORDER BY name_key, entity_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return [
+            (
+                str(row["entity_id"]),
+                str(row["name"]),
+                _vector_or_none(row["embedding"]),
+            )
+            for row in rows
+        ]
+
+    def graph_rag_aliases(self) -> list[tuple[str, str, str]]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT alias.alias_name, alias.canonical_entity_id, entity.name
+                FROM graph_entity_aliases AS alias
+                JOIN graph_entities AS entity
+                    ON entity.entity_id = alias.canonical_entity_id
+                ORDER BY alias.alias_name_key
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return [
+            (
+                str(row["alias_name"]),
+                str(row["canonical_entity_id"]),
+                str(row["name"]),
+            )
+            for row in rows
+        ]
+
+    def graph_rag_degrees(self) -> dict[str, int]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT mention.entity_id, COUNT(DISTINCT mention.memory_id) AS degree
+                FROM (
+                    SELECT from_entity_id AS entity_id, memory_id
+                    FROM graph_edges
+                    UNION ALL
+                    SELECT to_entity_id AS entity_id, memory_id
+                    FROM graph_edges
+                ) AS mention
+                JOIN memories
+                    ON memories.id = mention.memory_id
+                    AND memories.status = 'active'
+                    AND memories.expired = false
+                GROUP BY mention.entity_id
+                """
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return {str(row["entity_id"]): int(row["degree"]) for row in rows}
+
+    def graph_rag_edges(
+        self,
+        entity_ids: Sequence[str],
+    ) -> list[tuple[str, str, str, str, str, str, str]]:
+        if not entity_ids:
+            return []
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT edge.edge_id, edge.memory_id, edge.relation,
+                       edge.from_entity_id, source.name AS source_name,
+                       edge.to_entity_id, target.name AS target_name
+                FROM graph_edges AS edge
+                JOIN memories
+                    ON memories.id = edge.memory_id
+                    AND memories.status = 'active'
+                    AND memories.expired = false
+                JOIN graph_entities AS source
+                    ON source.entity_id = edge.from_entity_id
+                JOIN graph_entities AS target
+                    ON target.entity_id = edge.to_entity_id
+                WHERE edge.from_entity_id = ANY(%s)
+                   OR edge.to_entity_id = ANY(%s)
+                ORDER BY edge.edge_id
+                """,
+                (list(entity_ids), list(entity_ids)),
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return [
+            (
+                str(row["edge_id"]),
+                str(row["memory_id"]),
+                str(row["relation"]),
+                str(row["from_entity_id"]),
+                str(row["source_name"]),
+                str(row["to_entity_id"]),
+                str(row["target_name"]),
+            )
+            for row in rows
+        ]
+
+    def graph_rag_memory_similarities(
+        self,
+        memory_ids: Sequence[str],
+        query_vector: Sequence[float],
+    ) -> list[tuple[str, str, float]]:
+        if not memory_ids:
+            return []
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, content, (embedding <=> %s::vector) AS distance
+                FROM memories
+                WHERE id = ANY(%s)
+                  AND status = 'active'
+                  AND expired = false
+                """,
+                (list(query_vector), list(memory_ids)),
+            )
+            rows = cursor.fetchall()
+        self._connection.commit()
+        return [
+            (
+                str(row["id"]),
+                str(row["content"]),
+                1.0 - float(row["distance"]),
             )
             for row in rows
         ]

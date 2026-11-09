@@ -1699,6 +1699,165 @@ class MemoryAPITest(unittest.TestCase):
             "The user prefers Python.",
         )
 
+    def test_episodes_follow_entity_degree_and_keep_an_unchanged_title(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import EpisodeSettings
+
+        first = self.store.write_memory(
+            "Ada studies at North College.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        second = self.store.write_memory(
+            "Ada continues at North College.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        third = self.store.write_memory(
+            "Ada lives in City.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        fourth = self.store.write_memory(
+            "Ada visits Town.",
+            memory_type=MemoryType.FACT,
+            role="user",
+            source="test",
+            session_id="session-2",
+        )
+        for index in range(4):
+            self.store.write_memory(
+                f"Ada keeps note {index}.",
+                memory_type=MemoryType.FACT,
+                role="user",
+                source="test",
+                session_id="session-2",
+            )
+        extractor = ScriptedGraphExtractor(
+            {
+                first.id: (("Ada", "studies at", "North College"),),
+                second.id: (("Ada", "continues at", "North College"),),
+                third.id: (("Ada", "lives in", "City"),),
+                fourth.id: (("Ada", "visits", "Town"),),
+            }
+        )
+        AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            graph_extractor=extractor,
+            entity_judge=ScriptedEntityJudge("not_same_entity"),
+        ).memory_graph_build()
+        titler = ScriptedEpisodeTitler()
+        memory = AgentMemory(
+            self.store,
+            FakeMemorySelector(),
+            source="test",
+            session_id="session-2",
+            episode_titler=titler,
+        )
+        built = memory.memory_episode_build()
+        self.assertEqual(built.episode_count, 1)
+        self.assertEqual(built.titled_count, 1)
+        college_members = tuple(sorted((first.id, second.id)))
+        self.assertEqual(
+            set(self.store.memory_episode_groups()),
+            {
+                (
+                    "North College",
+                    ("North College",),
+                    college_members,
+                ),
+            },
+        )
+        again = memory.memory_episode_build()
+        self.assertEqual(again.episode_count, 1)
+        self.assertEqual(again.titled_count, 0)
+        self.assertEqual(len(titler.calls), 1)
+        self.assertEqual(self.store.memory_episode_member_counts(), (2,))
+        self.assertIn("North College", self.store.memory_episode_summaries()[0])
+        self.assertEqual(self.store.memory_episode_embeddings(), ([0.0, 0.0, 1.0],))
+        embed_calls = {"count": 0}
+        original_embed = self.store._embed
+
+        def _counting_embed(texts):
+            embed_calls["count"] += len(texts)
+            return original_embed(texts)
+
+        self.store._embed = _counting_embed
+        again = memory.memory_episode_build()
+        self.assertEqual(again.episode_count, 1)
+        self.assertEqual(again.titled_count, 0)
+        self.assertEqual(len(titler.calls), 1)
+        self.assertEqual(embed_calls["count"], 0)
+        self.store.clear_built_episodes()
+        self.assertEqual(self.store.memory_episode_groups(), ())
+        self.assertGreater(self.store.graph_edge_count(), 0)
+        self.assertGreater(self.store.count(), 0)
+        self.store.clear_built_graph()
+        self.assertEqual(self.store.graph_edge_count(), 0)
+        self.assertEqual(self.store.graph_entity_count(), 0)
+        self.assertGreater(self.store.count(), 0)
+        self.store.clear()
+        self.assertEqual(self.store.memory_episode_groups(), ())
+
+    def test_episode_search_returns_the_nearest_five(self) -> None:
+        now = datetime.now(UTC)
+        vectors = (
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        )
+        with self.store._connection.cursor() as cursor:
+            for index, vector in enumerate(vectors):
+                cursor.execute(
+                    """
+                    INSERT INTO memory_episodes (
+                        episode_id, entity_key, title, summary, source_key,
+                        created_at, updated_at, member_count, embedding
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        f"ep{index}",
+                        f"key{index}",
+                        f"Title {index}",
+                        "A stored summary.",
+                        f"source{index}",
+                        now,
+                        now,
+                        2,
+                        vector,
+                    ),
+                )
+        self.store._connection.commit()
+
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            hierarchical_episode_retrieval,
+        )
+
+        found = hierarchical_episode_retrieval(
+            self.store,
+            "college notes",
+        )
+        self.assertEqual(
+            [episode.episode_id for episode in found],
+            ["ep0", "ep3", "ep4", "ep5", "ep1"],
+        )
+        self.assertAlmostEqual(found[0].similarity_score, 1.0)
+        self.assertAlmostEqual(found[4].similarity_score, 0.0)
+        self.assertEqual(found[0].member_count, 2)
+
 
 class RecordingStore:
     def __init__(
@@ -2327,6 +2486,250 @@ class MemoryConnectionTest(unittest.TestCase):
         )
 
 
+class EpisodeRuleTest(unittest.TestCase):
+    def test_prevalence_forms_specific_episodes_and_mixed_pairs(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import form_episodes
+
+        mentions = []
+        for memory_id in ("m1", "m2", "m3", "m4"):
+            mentions.append((memory_id, memory_id, "person", "Person"))
+            mentions.append((memory_id, memory_id, "wide", "Wide"))
+        mentions.extend(
+            (
+                ("m1", "m1", "college", "College"),
+                ("m2", "m2", "college", "College"),
+                ("m1", "m1", "topic", "Topic"),
+                ("m3", "m3", "city", "City"),
+            )
+        )
+        episodes = form_episodes(mentions, 8)
+        formed = {
+            (episode.entity_names, episode.memory_ids) for episode in episodes
+        }
+        self.assertEqual(
+            formed,
+            {
+                (("College",), ("m1", "m2")),
+                (("College", "Person"), ("m1", "m2")),
+                (("College", "Wide"), ("m1", "m2")),
+            },
+        )
+
+    def test_a_smaller_store_raises_the_prevalence_threshold(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import (
+            form_episodes,
+            prevalence_threshold,
+        )
+
+        mentions = [
+            (memory_id, memory_id, "person", "Person")
+            for memory_id in ("m1", "m2", "m3", "m4")
+        ]
+        mentions.extend(
+            (memory_id, memory_id, "wide", "Wide")
+            for memory_id in ("m1", "m2", "m3", "m4")
+        )
+        self.assertAlmostEqual(prevalence_threshold(0), 0.50)
+        self.assertAlmostEqual(prevalence_threshold(100), 0.25)
+        self.assertLess(prevalence_threshold(200), 0.20)
+        self.assertGreater(prevalence_threshold(10), prevalence_threshold(100))
+        self.assertGreater(
+            prevalence_threshold(100, decay_scale=500),
+            prevalence_threshold(100, decay_scale=100),
+        )
+        self.assertAlmostEqual(
+            prevalence_threshold(0, baseline=0.10),
+            0.40,
+        )
+        episodes = form_episodes(mentions, 10)
+        self.assertEqual(
+            {episode.entity_names for episode in episodes},
+            {("Person",), ("Wide",), ("Person", "Wide")},
+        )
+        self.assertEqual(form_episodes(mentions, 8), ())
+
+    def test_pair_overlap_uses_the_less_common_entity(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import form_episodes
+
+        mentions = []
+        for index in range(1, 7):
+            mentions.append((f"rare-{index}", f"rare-{index}", "rare", "Rare"))
+        for index in range(1, 21):
+            mentions.append((f"wide-{index}", f"wide-{index}", "wide", "Wide"))
+        mentions.extend(
+            (
+                ("rare-1", "rare-1", "wide", "Wide"),
+                ("rare-2", "rare-2", "wide", "Wide"),
+            )
+        )
+        self.assertEqual(
+            [
+                episode.entity_names
+                for episode in form_episodes(mentions, 100)
+                if len(episode.entity_ids) == 2
+            ],
+            [],
+        )
+        mentions.append(("rare-3", "rare-3", "wide", "Wide"))
+        pairs = [
+            episode
+            for episode in form_episodes(mentions, 100)
+            if len(episode.entity_ids) == 2
+        ]
+        self.assertEqual([episode.entity_names for episode in pairs], [("Rare", "Wide")])
+        self.assertEqual(pairs[0].memory_ids, ("rare-1", "rare-2", "rare-3"))
+
+    def test_contained_episode_is_removed_before_completion(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import (
+            EpisodeDraft,
+            drop_redundant_episodes,
+            episode_set_scores,
+        )
+
+        large = EpisodeDraft(
+            ("wide",),
+            ("Wide",),
+            tuple(f"m{index}" for index in range(12)),
+            tuple(f"m{index}" for index in range(12)),
+        )
+        inside = EpisodeDraft(
+            ("rare",),
+            ("Rare",),
+            tuple(f"m{index}" for index in range(8)) + ("x1", "x2"),
+            tuple(f"m{index}" for index in range(8)) + ("x1", "x2"),
+        )
+        separate = EpisodeDraft(
+            ("other",),
+            ("Other",),
+            ("m0", "m1", "m8", "y1", "y2"),
+            ("m0", "m1", "m8", "y1", "y2"),
+        )
+        jaccard, containment, novelty = episode_set_scores(
+            set(inside.memory_ids),
+            set(large.memory_ids),
+        )
+        self.assertAlmostEqual(jaccard, 8 / 14)
+        self.assertAlmostEqual(containment, 0.80)
+        self.assertAlmostEqual(novelty, 0.20)
+        kept = drop_redundant_episodes(
+            (inside, large, separate),
+            containment_threshold=0.80,
+            novelty_threshold=0.20,
+        )
+        self.assertEqual(
+            [episode.entity_names for episode in kept],
+            [("Wide",), ("Other",)],
+        )
+
+    def test_one_memory_stays_below_the_episode_minimum(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import form_episodes
+
+        mentions = [("m1", "m1", "once", "Once")]
+        self.assertEqual(form_episodes(mentions, 100), ())
+
+    def test_two_memories_above_the_prevalence_bound_stay_apart(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import form_episodes
+
+        mentions = [
+            ("m1", "m1", "person", "Person"),
+            ("m2", "m2", "person", "Person"),
+        ]
+        self.assertEqual(form_episodes(mentions, 4), ())
+
+    def test_prevalence_must_be_between_zero_and_one(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import EpisodeSettings
+
+        with self.assertRaises(ValueError):
+            EpisodeSettings(mean_cohesion=1.5)
+        with self.assertRaises(ValueError):
+            EpisodeSettings(prevalence_decay_scale=0.5)
+
+    def test_cohesion_summary_matches_the_centroid_similarities(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import (
+            cohesion_summary,
+            embedding_cohesion,
+        )
+
+        cohesion, minimum, deviation = cohesion_summary((0.88, 0.84, 0.86, 0.82))
+        self.assertAlmostEqual(cohesion, 0.85)
+        self.assertAlmostEqual(minimum, 0.82)
+        self.assertAlmostEqual(deviation, math.sqrt(0.0005))
+        cohesion, minimum, deviation = cohesion_summary((0.91, 0.88, 0.86, 0.43))
+        self.assertAlmostEqual(cohesion, 0.77)
+        self.assertAlmostEqual(minimum, 0.43)
+        self.assertGreater(deviation, 0.15)
+
+        same, same_minimum, same_deviation, scores = embedding_cohesion(
+            ([1.0, 0.0], [1.0, 0.0])
+        )
+        self.assertAlmostEqual(same, 1.0)
+        self.assertAlmostEqual(same_minimum, 1.0)
+        self.assertAlmostEqual(same_deviation, 0.0)
+        self.assertEqual(len(scores), 2)
+
+    def test_one_entity_episode_drops_a_memory_below_minimum_cohesion(self) -> None:
+        from ai_agent_memory_infrastructure.memory_episode import (
+            EpisodeDraft,
+            apply_single_entity_cohesion,
+        )
+
+        single = EpisodeDraft(
+            entity_ids=("college",),
+            entity_names=("College",),
+            memory_ids=("m1", "m2", "m3"),
+            memory_contents=("one", "two", "three"),
+        )
+        pair = EpisodeDraft(
+            entity_ids=("college", "person"),
+            entity_names=("College", "Person"),
+            memory_ids=("m1", "m3"),
+            memory_contents=("one", "three"),
+        )
+        embeddings = {
+            "m1": [1.0, 0.0, 0.0],
+            "m2": [1.0, 0.0, 0.0],
+            "m3": [0.0, 1.0, 0.0],
+        }
+        kept = apply_single_entity_cohesion(
+            (single, pair),
+            embeddings,
+            minimum_cohesion=0.60,
+            mean_cohesion=0.70,
+        )
+        self.assertEqual(kept[0].memory_ids, ("m1", "m2"))
+        self.assertAlmostEqual(kept[0].cohesion, 1.0)
+        self.assertAlmostEqual(kept[0].minimum_cohesion, 1.0)
+        self.assertAlmostEqual(kept[0].cohesion_stddev, 0.0)
+        self.assertEqual(kept[1].memory_ids, ("m1", "m3"))
+        self.assertIsNone(kept[1].cohesion)
+
+        removed = apply_single_entity_cohesion(
+            (single,),
+            embeddings,
+            minimum_cohesion=0.95,
+            mean_cohesion=0.70,
+        )
+        self.assertEqual(removed, ())
+
+        angle = 2 * math.acos(0.65)
+        loose = EpisodeDraft(
+            entity_ids=("college",),
+            entity_names=("College",),
+            memory_ids=("m1", "m2"),
+            memory_contents=("one", "two"),
+        )
+        loose_kept = apply_single_entity_cohesion(
+            (loose,),
+            {
+                "m1": [1.0, 0.0],
+                "m2": [math.cos(angle), math.sin(angle)],
+            },
+            minimum_cohesion=0.60,
+            mean_cohesion=0.70,
+        )
+        self.assertEqual(loose_kept, ())
+
+
 class EntitySimilarityTest(unittest.TestCase):
     def test_score_vector_uses_levenshtein_jaccard_and_cosine(self) -> None:
         self.assertEqual(
@@ -2397,6 +2800,17 @@ class ScriptedEntityJudge:
 
             return self.verdict[(entity_name_key(candidate), entity_name_key(existing))]
         return self.verdict
+
+
+class ScriptedEpisodeTitler:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    def title(self, entity_names, memory_contents) -> tuple[str, str]:
+        names = tuple(entity_names)
+        contents = tuple(memory_contents)
+        self.calls.append((names, contents))
+        return " / ".join(names), " ".join(contents)
 
 
 class ScriptedGraphExtractor:
@@ -2839,6 +3253,889 @@ class AtomicScoreTest(unittest.TestCase):
         self.assertEqual(scored.clause_count, 1)
         self.assertEqual(scored.coordinated_item_count, 2)
         self.assertEqual(scored.coordination_count, 1)
+
+
+class HierarchicalAtomicRetrievalTest(unittest.TestCase):
+    def test_semantic_pool_is_cut_to_the_weighted_top(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            hierarchical_atomic_retrieval,
+        )
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+        matches = []
+        for index in range(12):
+            matches.append(
+                MemoryMatch(
+                    memory=Memory(
+                        id=f"m{index}",
+                        content=f"memory {index}",
+                        memory_type=MemoryType.FACT,
+                        role="user",
+                        source="test",
+                        session_id="session",
+                        importance=0.5,
+                        created_at=moment,
+                        updated_at=moment,
+                        metadata={},
+                        reinforced_at=moment,
+                    ),
+                    similarity_score=1 - (index * 0.05),
+                )
+            )
+
+        class _Store:
+            def __init__(self) -> None:
+                self.limit = None
+                self.accessed: list[str] = []
+
+            def memory_search(self, query, *, limit, min_similarity=None, filters=None):
+                self.limit = limit
+                return matches[:limit]
+
+            def memory_mark_accessed(self, memory_ids, accessed_at) -> None:
+                self.accessed = list(memory_ids)
+
+        store = _Store()
+        settings = ReadPathSettings()
+        weighted, candidates = hierarchical_atomic_retrieval(
+            store,
+            "query",
+            settings=settings,
+            now=moment,
+        )
+        self.assertEqual(store.limit, 30)
+        self.assertEqual(len(candidates), 12)
+        self.assertEqual(len(weighted), 10)
+        self.assertEqual(
+            [item.memory.id for item in weighted],
+            [f"m{index}" for index in range(10)],
+        )
+        self.assertEqual(store.accessed, [f"m{index}" for index in range(12)])
+
+    def test_one_reranker_orders_atomics_and_episodes_together(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            RetrievedEpisode,
+            atomic_candidate_text,
+            coselect_hierarchical_candidates,
+            episode_candidate_text,
+        )
+        from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+        atomic = RetrievedMemory(
+            memory=Memory(
+                id="memory-1",
+                content="The user built an XGBoost scorecard with KS 0.271.",
+                memory_type=MemoryType.FACT,
+                role="user",
+                source="test",
+                session_id="session",
+                importance=0.5,
+                created_at=moment,
+                updated_at=moment,
+                metadata={},
+            ),
+            semantic_score=0.4,
+            recency_score=0.4,
+            retrieval_score=0.4,
+            final_score=0.4,
+        )
+        episode = RetrievedEpisode(
+            episode_id="episode-1",
+            title="WeBank Internship",
+            summary=(
+                "Summer internship involving consumer lending analytics, "
+                "risk dashboards, an AI assistant, XGBoost modeling, and "
+                "recovery analysis."
+            ),
+            member_count=3,
+            similarity_score=0.8,
+            entity_names=("WeBank", "XGBoost", "AlloBank"),
+        )
+        self.assertEqual(
+            atomic_candidate_text(atomic.memory.content),
+            "TYPE: ATOMIC_MEMORY\nCONTENT: The user built an XGBoost "
+            "scorecard with KS 0.271.",
+        )
+        self.assertEqual(
+            episode_candidate_text(
+                episode.title,
+                episode.summary,
+                episode.entity_names,
+            ),
+            "TYPE: EPISODE\n"
+            "TITLE: WeBank Internship\n"
+            "SUMMARY: Summer internship involving consumer lending "
+            "analytics, risk dashboards, an AI assistant, XGBoost modeling, "
+            "and recovery analysis.\n"
+            "ENTITIES: WeBank, XGBoost, AlloBank.",
+        )
+
+        class _Reranker:
+            def rerank_mixed(self, query, candidates):
+                return {
+                    candidate_id: 0.2 if candidate_id.startswith("atomic:") else 0.9
+                    for candidate_id, _text in candidates
+                }
+
+        ranked = coselect_hierarchical_candidates(
+            "How did the internship go?",
+            (atomic,),
+            (episode,),
+            _Reranker(),
+        )
+        self.assertEqual([item.kind for item in ranked], ["EPISODE", "ATOMIC_MEMORY"])
+        self.assertEqual(ranked[0].score, 0.9)
+        self.assertEqual(ranked[1].score, 0.2)
+
+    def test_rerank_tie_prefers_an_episode_then_embedding_similarity(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            RetrievedEpisode,
+            rank_hierarchical_candidates,
+        )
+        from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+
+        def atomic(memory_id: str, semantic_score: float) -> RetrievedMemory:
+            return RetrievedMemory(
+                memory=Memory(
+                    id=memory_id,
+                    content=memory_id,
+                    memory_type=MemoryType.FACT,
+                    role="user",
+                    source="test",
+                    session_id="session",
+                    importance=0.5,
+                    created_at=moment,
+                    updated_at=moment,
+                    metadata={},
+                ),
+                semantic_score=semantic_score,
+                recency_score=0.0,
+                retrieval_score=0.0,
+                final_score=0.0,
+            )
+
+        def episode(episode_id: str, similarity: float) -> RetrievedEpisode:
+            return RetrievedEpisode(
+                episode_id=episode_id,
+                title=episode_id,
+                summary=episode_id,
+                member_count=2,
+                similarity_score=similarity,
+            )
+
+        ranked = rank_hierarchical_candidates(
+            (
+                atomic("atomic-high", 0.9),
+                atomic("atomic-low", 0.2),
+                atomic("atomic-best", 0.1),
+            ),
+            (
+                episode("episode-low", 0.1),
+                episode("episode-high", 0.8),
+            ),
+            {
+                "atomic:atomic-high": 0.5,
+                "atomic:atomic-low": 0.5,
+                "atomic:atomic-best": 0.9,
+                "episode:episode-low": 0.5,
+                "episode:episode-high": 0.5,
+            },
+        )
+        self.assertEqual(
+            [
+                item.episode.episode_id if item.episode else item.memory.memory.id
+                for item in ranked
+            ],
+            [
+                "atomic-best",
+                "episode-high",
+                "episode-low",
+                "atomic-high",
+                "atomic-low",
+            ],
+        )
+
+    def test_group_selector_keeps_episode_or_atomics_then_top_five(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            RankedCandidate,
+            RetrievedEpisode,
+            select_hierarchical_return,
+        )
+        from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+
+        def atomic(memory_id: str, score: float) -> RankedCandidate:
+            memory = RetrievedMemory(
+                memory=Memory(
+                    id=memory_id,
+                    content=f"content {memory_id}",
+                    memory_type=MemoryType.FACT,
+                    role="user",
+                    source="test",
+                    session_id="session",
+                    importance=0.5,
+                    created_at=moment,
+                    updated_at=moment,
+                    metadata={},
+                ),
+                semantic_score=score,
+                recency_score=score,
+                retrieval_score=score,
+                final_score=score,
+                rerank_score=score,
+            )
+            return RankedCandidate(
+                kind="ATOMIC_MEMORY",
+                score=score,
+                text=memory.memory.content,
+                memory=memory,
+            )
+
+        def episode(episode_id: str, score: float) -> RankedCandidate:
+            stored = RetrievedEpisode(
+                episode_id=episode_id,
+                title=episode_id,
+                summary=f"summary {episode_id}",
+                member_count=2,
+                similarity_score=score,
+                entity_names=("WeBank",),
+                rerank_score=score,
+            )
+            return RankedCandidate(
+                kind="EPISODE",
+                score=score,
+                text=stored.summary,
+                episode=stored,
+            )
+
+        class _Selector:
+            def __init__(self, choice: str) -> None:
+                self.choice = choice
+                self.calls = 0
+
+            def choose(self, query, title, summary, entity_names, atomic_contents):
+                self.calls += 1
+                self.seen_contents = list(atomic_contents)
+                self.seen_summary = summary
+                return self.choice
+
+        ranked = (
+            episode("ep-high", 0.95),
+            atomic("inside", 0.90),
+            atomic("outside", 0.80),
+            episode("ep-low", 0.10),
+        )
+        members = {
+            "ep-high": {"inside", "held-back", "held-back-two"},
+            "ep-low": set(),
+        }
+        episode_only = _Selector("episode_only")
+        kept = select_hierarchical_return(
+            "query",
+            ranked,
+            members,
+            episode_only,
+            limit=5,
+        )
+        self.assertEqual(episode_only.calls, 1)
+        self.assertEqual(episode_only.seen_contents, ["content inside"])
+        self.assertEqual(episode_only.seen_summary, "summary ep-high")
+        self.assertEqual(
+            [item.kind + ":" + (
+                item.episode.episode_id if item.episode else item.memory.memory.id
+            ) for item in kept],
+            ["EPISODE:ep-high", "ATOMIC_MEMORY:outside", "EPISODE:ep-low"],
+        )
+
+        atom_only = _Selector("atom_only")
+        kept_atoms = select_hierarchical_return(
+            "query",
+            ranked,
+            members,
+            atom_only,
+            limit=5,
+        )
+        self.assertEqual(
+            [item.kind for item in kept_atoms],
+            ["ATOMIC_MEMORY", "ATOMIC_MEMORY", "EPISODE"],
+        )
+        self.assertEqual(kept_atoms[0].memory.memory.id, "inside")
+        self.assertEqual(kept_atoms[2].episode.episode_id, "ep-low")
+
+        many = tuple(atomic(f"m{index}", 1 - index / 100) for index in range(6))
+        cut = select_hierarchical_return("query", many, {}, None, limit=5)
+        self.assertEqual(len(cut), 5)
+        self.assertEqual(cut[0].memory.memory.id, "m0")
+        self.assertEqual(cut[4].memory.memory.id, "m4")
+        self.assertEqual(cut.statuses, ("selected",) * 5 + ("",))
+
+        perfect = (
+            episode("perfect-episode", 1.0),
+            *[atomic(f"perfect-{index}", 1.0) for index in range(5)],
+            atomic("lower", 0.4),
+        )
+        kept_perfect = select_hierarchical_return(
+            "query",
+            perfect,
+            {},
+            None,
+            limit=5,
+        )
+        self.assertEqual(len(kept_perfect), 6)
+        self.assertTrue(all(item.score == 1.0 for item in kept_perfect))
+        self.assertEqual(kept_perfect[0].episode.episode_id, "perfect-episode")
+        self.assertEqual(kept_perfect.statuses, ("selected",) * 6 + ("",))
+
+    def test_eighty_percent_coverage_keeps_episode_before_selector(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            RankedCandidate,
+            RetrievedEpisode,
+            select_hierarchical_return,
+        )
+        from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+
+        def atomic(memory_id: str, score: float) -> RankedCandidate:
+            memory = RetrievedMemory(
+                memory=Memory(
+                    id=memory_id,
+                    content=f"content {memory_id}",
+                    memory_type=MemoryType.FACT,
+                    role="user",
+                    source="test",
+                    session_id="session",
+                    importance=0.5,
+                    created_at=moment,
+                    updated_at=moment,
+                    metadata={},
+                ),
+                semantic_score=score,
+                recency_score=score,
+                retrieval_score=score,
+                final_score=score,
+                rerank_score=score,
+            )
+            return RankedCandidate(
+                kind="ATOMIC_MEMORY",
+                score=score,
+                text=memory.memory.content,
+                memory=memory,
+            )
+
+        def episode(episode_id: str, score: float) -> RankedCandidate:
+            stored = RetrievedEpisode(
+                episode_id=episode_id,
+                title=episode_id,
+                summary=f"summary {episode_id}",
+                member_count=5,
+                similarity_score=score,
+                entity_names=("WeBank",),
+                rerank_score=score,
+            )
+            return RankedCandidate(
+                kind="EPISODE",
+                score=score,
+                text=stored.summary,
+                episode=stored,
+            )
+
+        class _Selector:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.titles: list[str] = []
+
+            def choose(self, query, title, summary, entity_names, atomic_contents):
+                self.calls += 1
+                self.titles.append(title)
+                return "atom_only"
+
+        ranked = (
+            episode("covered", 0.95),
+            atomic("m1", 0.90),
+            atomic("m2", 0.85),
+            atomic("m3", 0.80),
+            atomic("m4", 0.75),
+            atomic("outside", 0.70),
+            episode("partial", 0.60),
+            atomic("only-partial", 0.50),
+        )
+        members = {
+            "covered": {"m1", "m2", "m3", "m4", "not-retrieved"},
+            "partial": {"only-partial", "away-one", "away-two"},
+        }
+        selector = _Selector()
+        kept = select_hierarchical_return(
+            "query",
+            ranked,
+            members,
+            selector,
+            limit=5,
+        )
+        self.assertEqual(selector.calls, 1)
+        self.assertEqual(selector.titles, ["partial"])
+        self.assertEqual(
+            [
+                item.episode.episode_id if item.episode else item.memory.memory.id
+                for item in kept
+            ],
+            ["covered", "outside", "only-partial"],
+        )
+        self.assertEqual(
+            kept.statuses,
+            (
+                "selected",
+                "removed",
+                "removed",
+                "removed",
+                "removed",
+                "selected",
+                "removed",
+                "selected",
+            ),
+        )
+
+    def test_prompt_orders_atomics_then_episodes_by_rerank(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            RankedCandidate,
+            RetrievedEpisode,
+            format_hierarchical_context,
+        )
+        from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+
+        def atomic(memory_id: str, content: str, memory_type: MemoryType, score: float) -> RankedCandidate:
+            memory = RetrievedMemory(
+                memory=Memory(
+                    id=memory_id,
+                    content=content,
+                    memory_type=memory_type,
+                    role="user",
+                    source="test",
+                    session_id="session",
+                    importance=0.5,
+                    created_at=moment,
+                    updated_at=moment,
+                    metadata={},
+                ),
+                semantic_score=score,
+                recency_score=score,
+                retrieval_score=score,
+                final_score=score,
+                rerank_score=score,
+            )
+            return RankedCandidate(
+                kind="ATOMIC_MEMORY",
+                score=score,
+                text=content,
+                memory=memory,
+            )
+
+        def episode(
+            episode_id: str,
+            score: float,
+            contents: tuple[str, ...],
+        ) -> RankedCandidate:
+            stored = RetrievedEpisode(
+                episode_id=episode_id,
+                title=f"Title {episode_id}",
+                summary=f"Summary {episode_id}",
+                member_count=len(contents),
+                similarity_score=score,
+                entity_names=("WeBank", "XGBoost"),
+                rerank_score=score,
+                member_contents=contents,
+            )
+            return RankedCandidate(
+                kind="EPISODE",
+                score=score,
+                text=stored.summary,
+                episode=stored,
+            )
+
+        text = format_hierarchical_context(
+            (
+                episode("low", 0.20, ("Older memory.", "Newer memory.")),
+                atomic("pref", "User wants short answers.", MemoryType.PREFERENCE, 0.910),
+                episode("high", 0.95, ("The user interned at WeBank.",)),
+                atomic("fact", "The user's name is Beta.", MemoryType.FACT, 0.400),
+            )
+        )
+        self.assertEqual(
+            text,
+            "\n".join(
+                [
+                    "fact",
+                    "- [user; relevance=0.400; ] The user's name is Beta.",
+                    "preference",
+                    "- [user; relevance=0.910; ] User wants short answers.",
+                    "",
+                    "Title high (0.950)",
+                    "summary: Summary high",
+                    "entities: WeBank, XGBoost",
+                    "- The user interned at WeBank.",
+                    "",
+                    "Title low (0.200)",
+                    "summary: Summary low",
+                    "entities: WeBank, XGBoost",
+                    "- Older memory.",
+                    "- Newer memory.",
+                ]
+            ),
+        )
+
+
+    def test_choice_marks_keep_returned_candidates(self) -> None:
+        from ai_agent_memory_infrastructure.memory_hierarchical import (
+            RankedCandidate,
+            RetrievedEpisode,
+            select_hierarchical_return,
+        )
+        from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+
+        def atomic(memory_id: str, score: float) -> RankedCandidate:
+            memory = RetrievedMemory(
+                memory=Memory(
+                    id=memory_id,
+                    content=memory_id,
+                    memory_type=MemoryType.FACT,
+                    role="user",
+                    source="test",
+                    session_id="session",
+                    importance=0.5,
+                    created_at=moment,
+                    updated_at=moment,
+                    metadata={},
+                ),
+                semantic_score=score,
+                recency_score=0.0,
+                retrieval_score=score,
+                final_score=score,
+            )
+            return RankedCandidate(
+                kind="ATOMIC_MEMORY",
+                score=score,
+                text=memory_id,
+                memory=memory,
+            )
+
+        episode = RankedCandidate(
+            kind="EPISODE",
+            score=0.4,
+            text="episode",
+            episode=RetrievedEpisode(
+                episode_id="ep",
+                title="ep",
+                summary="ep",
+                member_count=2,
+                similarity_score=0.4,
+            ),
+        )
+        kept = select_hierarchical_return(
+            "query",
+            (atomic("first", 0.9), atomic("second", 0.8), episode),
+            {},
+            None,
+            limit=2,
+        )
+        self.assertEqual(kept.statuses, ("selected", "selected", ""))
+
+
+class RuntimeTimingTest(unittest.TestCase):
+    def test_trace_records_nested_sections_and_collapses_repeats(self) -> None:
+        from ai_agent_memory_infrastructure.memory_timing import (
+            collapse_runtime_spans,
+            runtime_span,
+            runtime_trace,
+        )
+
+        with runtime_trace("Chat", "Message") as trace:
+            with runtime_span("Read"):
+                with runtime_span("Embed"):
+                    pass
+                with runtime_span("Embed"):
+                    pass
+        self.assertEqual(trace.path, "Chat")
+        self.assertEqual(trace.trigger, "Message")
+        self.assertEqual(trace.spans[0].name, "Read")
+        self.assertEqual(
+            [span.name for span in trace.spans[0].children],
+            ["Embed", "Embed"],
+        )
+        collapsed = collapse_runtime_spans(trace.spans)
+        self.assertEqual(collapsed[0].children[0].name, "Embed × 2")
+        self.assertEqual(
+            collapsed[0].children[0].seconds,
+            trace.spans[0].children[0].seconds + trace.spans[0].children[1].seconds,
+        )
+
+    def test_span_outside_a_trace_does_nothing(self) -> None:
+        from ai_agent_memory_infrastructure.memory_timing import runtime_span
+
+        with runtime_span("Read"):
+            pass
+
+
+class GraphRagTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = PostgresMemoryStore(
+            database_url="postgresql://localhost:5432/agent_memory_test",
+            api_key="test-key",
+            dimensions=3,
+        )
+        self.store._embed = self._fake_embed
+        self.store.clear()
+
+    def tearDown(self) -> None:
+        self.store.clear()
+        self.store._connection.close()
+
+    @staticmethod
+    def _fake_embed(texts):
+        embeddings = []
+        for text in texts:
+            lowered = text.lower()
+            if "python" in lowered:
+                embeddings.append([1.0, 0.0, 0.0])
+            else:
+                embeddings.append([0.0, 0.0, 1.0])
+        return embeddings
+
+    def _memory(
+        self,
+        memory_id: str,
+        content: str,
+        *,
+        status: MemoryStatus = MemoryStatus.ACTIVE,
+        expired: bool = False,
+        embedding: list[float] | None = None,
+    ) -> None:
+        moment = datetime(2026, 6, 1, tzinfo=UTC)
+        self.store.import_record(
+            memory_id=memory_id,
+            content=content,
+            memory_type="fact",
+            role="user",
+            source="test",
+            session_id="graph-rag",
+            importance=0.5,
+            created_at=moment,
+            updated_at=moment,
+            metadata={},
+            embedding=embedding or [0.0, 0.0, 1.0],
+            status=status,
+            expired=expired,
+        )
+
+    def _edge(
+        self,
+        memory_id: str,
+        source: str,
+        relation: str,
+        target: str,
+        embeddings: dict[str, list[float]] | None = None,
+    ) -> None:
+        self.store.replace_memory_graph(
+            memory_id,
+            f"key-{memory_id}-{source}-{target}",
+            [(source, relation, target)],
+            embeddings,
+        )
+
+    def test_explicit_seed_walks_one_hop_and_reranks(self) -> None:
+        from ai_agent_memory_infrastructure.memory_graph_rag import (
+            GraphRagSettings,
+            run_graph_rag,
+        )
+
+        self._memory("m1", "The assistant uses Dify.")
+        self._memory("m2", "The assistant uses DuckDB.")
+        self._memory("m3", "Lived in Boston.")
+        self._memory("m4", "Wrote notes.")
+        self._memory("m5", "Kept a journal.")
+        self._memory(
+            "old",
+            "The assistant uses a retired tool.",
+            expired=True,
+        )
+        self.store.replace_memory_graph(
+            "m1",
+            "key-m1",
+            [
+                ("AI Assistant", "uses", "Dify"),
+                ("The user", "built", "AI Assistant"),
+            ],
+        )
+        self.store.replace_memory_graph(
+            "m2",
+            "key-m2",
+            [
+                ("AI Assistant", "uses", "DuckDB"),
+                ("The user", "built", "AI Assistant"),
+            ],
+        )
+        self._edge("m3", "The user", "lived in", "Boston")
+        self._edge("m4", "The user", "wrote", "Notes")
+        self._edge("m5", "The user", "kept", "Journal")
+        self._edge("old", "AI Assistant", "uses", "Retired")
+        before_entities = self.store.graph_entity_count()
+        before_aliases = len(self.store.graph_rag_aliases())
+
+        class _Reranker:
+            def rerank(self, query, candidates):
+                return {
+                    candidate.memory.id: (
+                        0.9 if "DuckDB" in candidate.memory.content else 0.2
+                    )
+                    for candidate in candidates
+                }
+
+        class _Answerer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def answer(self, query, paths, memories):
+                self.calls += 1
+                self.memory_ids = [memory.memory_id for memory in memories]
+                return "You used DuckDB."
+
+        answerer = _Answerer()
+        result = run_graph_rag(
+            self.store,
+            "What tools did I use for my AI assistant?",
+            reranker=_Reranker(),
+            answerer=answerer,
+            settings=GraphRagSettings(
+                final_top_k=1,
+                max_edges_per_seed=30,
+            ),
+        )
+        self.assertEqual([seed.name for seed in result.seed_entities], ["AI Assistant"])
+        self.assertNotIn("Retired", [path.target_name for path in result.paths])
+        self.assertTrue(all(path.hop == 1 for path in result.paths))
+        self.assertEqual(result.retrieved_memories[0].memory_id, "m2")
+        self.assertEqual(result.retrieved_memories[0].rerank_score, 0.9)
+        self.assertEqual(answerer.calls, 1)
+        self.assertEqual(answerer.memory_ids, ["m2"])
+        self.assertIn("m1", [path.memory_id for path in result.paths])
+        self.assertEqual(self.store.graph_entity_count(), before_entities)
+        self.assertEqual(len(self.store.graph_rag_aliases()), before_aliases)
+        record = result.as_record()
+        self.assertEqual(record["answer"], "You used DuckDB.")
+        self.assertEqual(record["paths"][0]["hop"], 1)
+
+    def test_broad_semantic_match_is_not_expanded(self) -> None:
+        from ai_agent_memory_infrastructure.memory_graph_rag import run_graph_rag
+
+        for index in range(5):
+            self._memory(f"m{index}", f"python note {index}", embedding=[1.0, 0.0, 0.0])
+            self._edge(
+                f"m{index}",
+                "AI Assistant",
+                "uses",
+                f"Tool {index}",
+                {"ai assistant": [1.0, 0.0, 0.0]},
+            )
+
+        class _Answerer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def answer(self, query, paths, memories):
+                self.calls += 1
+                return "should not run"
+
+        answerer = _Answerer()
+        result = run_graph_rag(
+            self.store,
+            "python notes",
+            reranker=object(),
+            answerer=answerer,
+        )
+        self.assertEqual(result.seed_entities, ())
+        self.assertEqual(answerer.calls, 0)
+        self.assertIn("No stored entity", result.answer)
+
+    def test_explicit_broad_seed_caps_edges(self) -> None:
+        from ai_agent_memory_infrastructure.memory_graph_rag import (
+            GraphRagSettings,
+            run_graph_rag,
+        )
+
+        for index in range(4):
+            self._memory(f"m{index}", f"Fact {index}.")
+            self._edge(f"m{index}", "The user", "did", f"Task {index}")
+
+        class _Reranker:
+            def rerank(self, query, candidates):
+                return {candidate.memory.id: 0.5 for candidate in candidates}
+
+        class _Answerer:
+            def answer(self, query, paths, memories):
+                return "Some tasks."
+
+        result = run_graph_rag(
+            self.store,
+            "What did the user do?",
+            reranker=_Reranker(),
+            answerer=_Answerer(),
+            settings=GraphRagSettings(max_edges_per_seed=2),
+        )
+        self.assertEqual([seed.name for seed in result.seed_entities], ["The user"])
+        self.assertTrue(result.seed_entities[0].broad)
+        self.assertEqual(result.paths, ())
+        self.assertIn("insufficient", result.answer)
+
+    def test_walk_stops_at_three_hops_and_skips_a_weak_edge(self) -> None:
+        from ai_agent_memory_infrastructure.memory_graph_rag import (
+            GraphRagSettings,
+            run_graph_rag,
+        )
+
+        self._memory("m1", "Widget uses Part.", embedding=[0.0, 0.0, 1.0])
+        self._memory("m2", "Part contains Piece.", embedding=[0.0, 0.0, 1.0])
+        self._memory("m3", "Piece links End.", embedding=[0.0, 0.0, 1.0])
+        self._memory("m4", "End goes Beyond.", embedding=[0.0, 0.0, 1.0])
+        self._memory("m5", "python stray from Widget.", embedding=[1.0, 0.0, 0.0])
+        self._edge("m1", "Widget", "uses", "Part")
+        self._edge("m2", "Part", "contains", "Piece")
+        self._edge("m3", "Piece", "links", "End")
+        self._edge("m4", "End", "goes to", "Beyond")
+        self._edge("m5", "Widget", "ignores", "Other")
+
+        class _Reranker:
+            def rerank(self, query, candidates):
+                return {candidate.memory.id: 0.5 for candidate in candidates}
+
+        class _Answerer:
+            def answer(self, query, paths, memories):
+                return "A chain."
+
+        result = run_graph_rag(
+            self.store,
+            "Tell me about Widget",
+            reranker=_Reranker(),
+            answerer=_Answerer(),
+            settings=GraphRagSettings(
+                final_top_k=5,
+                frontier_cap=5,
+                min_hop_similarity=0.50,
+            ),
+        )
+        self.assertEqual(
+            {path.memory_id for path in result.paths},
+            {"m1", "m2", "m3"},
+        )
+        self.assertEqual({path.hop for path in result.paths}, {1, 2, 3})
+        self.assertNotIn("m4", [path.memory_id for path in result.paths])
+        self.assertNotIn("m5", [path.memory_id for path in result.paths])
 
 
 if __name__ == "__main__":

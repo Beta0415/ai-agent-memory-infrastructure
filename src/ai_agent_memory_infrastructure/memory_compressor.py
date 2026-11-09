@@ -8,6 +8,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_agent_memory_infrastructure.memory_retrieval import RetrievedMemory
+from ai_agent_memory_infrastructure.memory_timing import timed
 
 
 class CompressedMemory(BaseModel):
@@ -64,6 +65,7 @@ class OpenAIMemoryCompressor:
     def model_name(self) -> str:
         return self._model
 
+    @timed("Compressor")
     def compress(
         self,
         memories: Sequence[RetrievedMemory],
