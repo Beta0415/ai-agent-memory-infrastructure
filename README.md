@@ -519,7 +519,7 @@ The candidate content is embedded and searched against `active` and `conflicted`
 Cosine similarity for vectors $u$ and $v$ is:
 
 $$
-\operatorname{cos}(u,v)=
+\mathrm{cos}(u,v)=
 \frac{u\cdot v}{\lVert u\rVert_2\,\lVert v\rVert_2}.
 $$
 
@@ -532,7 +532,7 @@ $$
 The default related set is at most five matches with similarity **strictly greater than** 0.60. The store uses a strict distance predicate; the final Python `similarity_above()` check also requires:
 
 $$
-\operatorname{round}(s,6)>\tau_{\mathrm{related}},
+\mathrm{round}(s,6)>\tau_{\mathrm{related}},
 \qquad \tau_{\mathrm{related}}=0.60.
 $$
 
@@ -586,7 +586,7 @@ Memory insertion, reinforcement, and link operations commit independently. A lat
 After `memory_add()` returns, the runtime checks:
 
 $$
-T_{\mathrm{store}}=\sum_{m\in\texttt{memories}}\operatorname{token\_count}(m),
+T_{\mathrm{store}}=\sum_{m\in\texttt{memories}}\mathrm{token\_count}(m),
 \qquad
 \text{run maintenance if }T_{\mathrm{store}}>C_{\mathrm{store}},
 \quad C_{\mathrm{store}}=10000.
@@ -668,11 +668,11 @@ Every memory returned in this semantic pool is marked with `last_accessed_at`. T
 The semantic and importance inputs are clamped:
 
 $$
-\operatorname{clip}_{[0,1]}(x)=\min(\max(x,0),1),
+\mathrm{clip}_{[0,1]}(x)=\min(\max(x,0),1),
 \qquad
-S_m=\operatorname{clip}_{[0,1]}(s_m),
+S_m=\mathrm{clip}_{[0,1]}(s_m),
 \qquad
-I_m=\operatorname{clip}_{[0,1]}(\operatorname{importance}_m).
+I_m=\mathrm{clip}_{[0,1]}(\mathrm{importance}_m).
 $$
 
 Recency is measured from `reinforced_at`, falling back to `created_at`:
@@ -746,7 +746,7 @@ Only the returned matches, normally at most four, are considered. Their existing
 Two memories are linked when:
 
 $$
-\operatorname{cos}(e_i,e_j)>\tau_{\mathrm{context}},
+\mathrm{cos}(e_i,e_j)>\tau_{\mathrm{context}},
 \qquad \tau_{\mathrm{context}}=0.90.
 $$
 
@@ -774,7 +774,7 @@ This step changes the read result, not PostgreSQL records or write-related memor
 After deduplication:
 
 $$
-T_{\mathrm{context}}=\sum_{m\in M_{\mathrm{kept}}}\operatorname{token\_count}(m).
+T_{\mathrm{context}}=\sum_{m\in M_{\mathrm{kept}}}\mathrm{token\_count}(m).
 $$
 
 The default trigger is:
@@ -798,7 +798,7 @@ Formally, a proposal $c'_m$ is accepted only when:
 $$
 c'_m\neq\varnothing
 \quad\land\quad
-\operatorname{tokens}(c'_m)<\operatorname{token\_count}(m).
+\mathrm{tokens}(c'_m)<\mathrm{token\_count}(m).
 $$
 
 The proposal mapping must contain the expected memory-ID set. One pass is used; there is no retry-until-budget loop. The result may remain over budget, and Python does not independently prove semantic preservation. PostgreSQL content is never rewritten by this compression.
@@ -899,7 +899,7 @@ For each pool memory, `similar_memories()` uses its already-stored embedding to 
 The default condition is strict similarity above 0.90. The Python helper additionally uses:
 
 $$
-\operatorname{round}(s_{ij},6)>\tau_{\mathrm{maintenance}},
+\mathrm{round}(s_{ij},6)>\tau_{\mathrm{maintenance}},
 \qquad \tau_{\mathrm{maintenance}}=0.90.
 $$
 
@@ -1049,7 +1049,7 @@ A source fingerprint covers:
 
 $$
 H_{\mathrm{graph}}(m)=
-\operatorname{SHA256}
+\mathrm{SHA256}
 \left(
 v_{\mathrm{extract}}
 \Vert c_m\Vert s_m\Vert p_m\Vert o_m
@@ -1101,10 +1101,10 @@ The name key is:
 
 $$
 k(n)=
-\operatorname{casefold}
+\mathrm{casefold}
 \left(
-\operatorname{join}_{\mathrm{space}}
-\left(\operatorname{split}_{\mathrm{whitespace}}(n)\right)
+\mathrm{join}_{\mathrm{space}}
+\left(\mathrm{split}_{\mathrm{whitespace}}(n)\right)
 \right).
 $$
 
@@ -1133,7 +1133,7 @@ L(a,b)=
 \begin{cases}
 1,&k(a)=k(b),\\
 1-\dfrac{d_{\mathrm{lev}}(k(a),k(b))}
-{\max(\operatorname{len}(k(a)),\operatorname{len}(k(b)))},
+{\max(\mathrm{len}(k(a)),\mathrm{len}(k(b)))},
 &\text{otherwise}.
 \end{cases}
 $$
@@ -1151,7 +1151,7 @@ $$
 Embedding similarity is:
 
 $$
-E(a,b)=\operatorname{cos}(e_a,e_b).
+E(a,b)=\mathrm{cos}(e_a,e_b).
 $$
 
 A pair is sent to the entity judge when:
@@ -1363,7 +1363,7 @@ For the $k$ stored content vectors in a single-entity episode:
 $$
 \mathbf{c}=\frac{1}{k}\sum_{i=1}^{k}\mathbf{v}_i,
 \qquad
-z_i=\operatorname{cos}(\mathbf{v}_i,\mathbf{c}).
+z_i=\mathrm{cos}(\mathbf{v}_i,\mathbf{c}).
 $$
 
 The statistics are:
@@ -1408,19 +1408,19 @@ J_{\mathrm{episodes}}(A,B)=
 $$
 
 $$
-\operatorname{containment}(B\mid A)=
+\mathrm{containment}(B\mid A)=
 \frac{\lvert A\cap B\rvert}{\lvert B\rvert},
 \qquad
-\operatorname{novelty}(B\mid A)=
+\mathrm{novelty}(B\mid A)=
 \frac{\lvert B\setminus A\rvert}{\lvert B\rvert}.
 $$
 
 The actual removal condition is:
 
 $$
-\operatorname{containment}(B\mid A)\geq0.80
+\mathrm{containment}(B\mid A)\geq0.80
 \quad\land\quad
-\operatorname{novelty}(B\mid A)\leq0.20.
+\mathrm{novelty}(B\mid A)\leq0.20.
 $$
 
 Jaccard is computed by the scoring helper but is not a separate threshold in the removal decision. For a nonempty candidate, containment and novelty sum to one; the two thresholds can nevertheless be configured independently.
@@ -1440,11 +1440,11 @@ The entity key is the sorted defining entity IDs joined with newlines. The sourc
 
 $$
 H_{\mathrm{episode}}=
-\operatorname{SHA256}
+\mathrm{SHA256}
 \left(
-\operatorname{sortedEntityIDs}
+\mathrm{sortedEntityIDs}
 \Vert
-\operatorname{sortedMemberIDs}
+\mathrm{sortedMemberIDs}
 \right).
 $$
 
@@ -1610,14 +1610,14 @@ This scoring does not expand an episode into its member texts for the reranker.
 Let $A_{\mathrm{retrieved}}$ be the atomic IDs in the mixed reranked pool and $M_E$ the stored membership IDs of an episode:
 
 $$
-\operatorname{coverage}(E)=
+\mathrm{coverage}(E)=
 \frac{\lvert A_{\mathrm{retrieved}}\cap M_E\rvert}{\lvert M_E\rvert}.
 $$
 
 For nonempty membership sets:
 
 $$
-\operatorname{coverage}(E)\geq0.80
+\mathrm{coverage}(E)\geq0.80
 \quad\Longrightarrow\quad
 \text{remove the overlapping atomic memories and retain the episode}.
 $$
@@ -1644,9 +1644,9 @@ For an atomic memory in multiple **remaining** groups:
 $$
 \text{remove}(m)
 \iff
-\left(\exists E:\ m\in E\ \land\ \operatorname{choice}(E)=\texttt{episode\_only}\right)
+\left(\exists E:\ m\in E\ \land\ \mathrm{choice}(E)=\texttt{episode\_only}\right)
 \land
-\neg\left(\exists E:\ m\in E\ \land\ \operatorname{choice}(E)=\texttt{atom\_only}\right).
+\neg\left(\exists E:\ m\in E\ \land\ \mathrm{choice}(E)=\texttt{atom\_only}\right).
 $$
 
 Atoms already removed by deterministic coverage remain removed. Each episode is removed only by its own `atom_only` outcome.
@@ -1767,7 +1767,7 @@ Degrees count distinct Active, nonexpired source memories incident to each entit
 Graph RAG uses the same prevalence-bound formula as episodes, with its own settings defaults. Its actual numerical broadness test is:
 
 $$
-\operatorname{broad}(e)=
+\mathrm{broad}(e)=
 \left(N>0\right)
 \land\left(d_e>0\right)
 \land
@@ -1837,7 +1837,7 @@ At each expanded entity:
 The passing condition is:
 
 $$
-\operatorname{cos}(e_m,e_q)\geq\tau_{\mathrm{hop}},
+\mathrm{cos}(e_m,e_q)\geq\tau_{\mathrm{hop}},
 \qquad \tau_{\mathrm{hop}}=0.50.
 $$
 
